@@ -1,5 +1,6 @@
 import type { DatabaseSync } from "node:sqlite";
 import { safeParseJsonRecord } from "@openclaw/normalization-core";
+import { asFiniteNumber } from "@openclaw/normalization-core/number-coercion";
 import { asNullableRecord } from "@openclaw/normalization-core/record-coerce";
 import { normalizeAgentRunTerminalReplySnapshot } from "../agents/agent-run-terminal-reply.js";
 import { selectDeliverableSessionsReply } from "../agents/tools/sessions-send-tokens.js";
@@ -384,8 +385,7 @@ function textField(record: Record<string, unknown>, key: string): string | null 
 }
 
 function numberField(record: Record<string, unknown>, key: string): number | null {
-  const value = record[key];
-  return typeof value === "number" && Number.isFinite(value) ? value : null;
+  return asFiniteNumber(record[key]) ?? null;
 }
 
 function recordField(record: Record<string, unknown>, key: string): Record<string, unknown> | null {
@@ -663,6 +663,7 @@ export function backfillDeliveryQueueEntriesFromEntryJson(db: DatabaseSync): voi
       `SELECT queue_name, id, entry_json
          FROM delivery_queue_entries
         WHERE status <> 'completed'
+          AND NOT (status = 'failed' AND recovery_state = 'failed_terminal_v1')
           AND (retry_count = 0
             OR last_attempt_at IS NULL
             OR last_error IS NULL

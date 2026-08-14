@@ -3,6 +3,8 @@
  */
 import fs from "node:fs";
 import path from "node:path";
+import { resolveTimerTimeoutMs } from "@openclaw/normalization-core/number-coercion";
+import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import {
   abortActiveReplyRuns,
   abortReplyRunBySessionId,
@@ -39,8 +41,7 @@ import {
 } from "../../logging/diagnostic-run-activity.js";
 import { logMessageQueuedWithBacklogPolicy } from "../../logging/diagnostic-runtime.js";
 import { diagnosticLogger as diag, logSessionStateChange } from "../../logging/diagnostic.js";
-import { resolveAgentIdFromSessionKey } from "../../routing/session-key.js";
-import { resolveTimerTimeoutMs } from "../../shared/number-coercion.js";
+import { resolveSessionAgentId } from "../agent-scope.js";
 import {
   ACTIVE_EMBEDDED_RUNS,
   ACTIVE_EMBEDDED_RUNS_BY_RUN_ID,
@@ -75,6 +76,7 @@ type EmbeddedAgentQueueFailureReason =
   | "not_streaming"
   | "stale_run"
   | "compacting"
+  | "tool_authority_mismatch"
   | "image_input_unsupported"
   | "source_reply_delivery_mode_mismatch"
   | "task_suggestion_delivery_mode_mismatch"
@@ -474,6 +476,59 @@ export async function queueEmbeddedAgentMessageWithOutcomeAsync(
 ): Promise<EmbeddedAgentQueueMessageOutcome> {
   const prepared = prepareEmbeddedAgentQueueMessage(sessionId, options);
   if (prepared.kind === "complete") {
+    const activeToolAuthorityFingerprint = normalizeOptionalString(
+      ACTIVE_EMBEDDED_RUNS.get(sessionId)?.toolAuthorityFingerprint,
+    );
+    const pendingInputAuthorityProven = Boolean(
+      activeToolAuthorityFingerprint &&
+      (normalizeOptionalString(options?.toolAuthorityFingerprint) ===
+        activeToolAuthorityFingerprint ||
+        normalizeOptionalString(options?.pendingInputAuthorityFingerprint) ===
+          activeToolAuthorityFingerprint),
+    );
+    if (
+      !prepared.outcome.queued &&
+      (prepared.outcome.reason === "tool_authority_mismatch" ||
+        prepared.outcome.reason === "image_input_unsupported") &&
+      options?.isInboundUserMessage === true &&
+      options.images?.length &&
+      pendingInputAuthorityProven
+    ) {
+      try {
+        await ACTIVE_EMBEDDED_RUNS.get(sessionId)?.cancelPendingUserInput?.("image-reply");
+      } catch (err) {
+        diag.warn(
+          `failed to cancel pending user input before queued image fallback: sessionId=${sessionId} err=${formatErrorMessage(err)}`,
+        );
+      }
+    }
+    if (
+      !prepared.outcome.queued &&
+      prepared.outcome.reason === "tool_authority_mismatch" &&
+      options?.isInboundUserMessage === true &&
+      !options.images?.length &&
+      pendingInputAuthorityProven
+    ) {
+      const claimPendingUserInputAnswer =
+        ACTIVE_EMBEDDED_RUNS.get(sessionId)?.claimPendingUserInputAnswer;
+      if (claimPendingUserInputAnswer) {
+        try {
+          if (await claimPendingUserInputAnswer(text, options)) {
+            options.onQueueAccepted?.(true);
+            logActiveRunMessageAccepted(sessionId);
+            return {
+              queued: true,
+              sessionId,
+              target: "embedded_run",
+              gatewayHealth: "live",
+              enqueuedAtMs: Date.now(),
+            };
+          }
+        } catch (err) {
+          return createQueueFailureOutcome(sessionId, "runtime_rejected", formatErrorMessage(err));
+        }
+      }
+    }
     return prepared.outcome;
   }
   const enqueuedAtMs = Date.now();
@@ -561,7 +616,11 @@ function prepareEmbeddedAgentQueueMessage(
       outcome: createQueueFailureOutcome(sessionId, "transcript_commit_wait_unsupported"),
     };
   }
-  const deliveryModeMismatch = resolveReplyBackendQueueMessageMismatch(handle, options);
+  const deliveryModeMismatch = resolveReplyBackendQueueMessageMismatch(
+    handle,
+    options,
+    resolveActiveReplyOperationForSessionId(sessionId),
+  );
   if (deliveryModeMismatch) {
     diag.debug(`queue message failed: sessionId=${sessionId} reason=${deliveryModeMismatch}`);
     return {
@@ -967,6 +1026,7 @@ export async function abortAndDrainEmbeddedAgentRun(params: {
 }
 
 type ForceClearSessionSnapshot = {
+  agentId: string;
   startedAt?: number;
   storePath: string;
   updatedAt: number;
@@ -977,13 +1037,14 @@ function tryLoadForceClearSessionSnapshot(
 ): ForceClearSessionSnapshot | undefined {
   try {
     const cfg = getRuntimeConfig();
-    const agentId = resolveAgentIdFromSessionKey(sessionKey);
+    const agentId = resolveSessionAgentId({ config: cfg, sessionKey });
     const storePath = resolveSessionStorePathCore(cfg.session?.store, { agentId });
-    const entry = loadSessionEntry({ sessionKey, storePath });
+    const entry = loadSessionEntry({ agentId, sessionKey, storePath });
     if (!entry || entry.status !== "running") {
       return undefined;
     }
     return {
+      agentId,
       ...(entry.startedAt === undefined ? {} : { startedAt: entry.startedAt }),
       storePath,
       updatedAt: entry.updatedAt,
@@ -998,6 +1059,7 @@ function tryLoadForceClearSessionSnapshot(
 
 /** Persists terminal state when a forced registry clear cannot emit normal lifecycle. */
 async function persistForceClearedEmbeddedRunTerminalState(params: {
+  agentId: string;
   sessionId: string;
   sessionKey: string;
   startedAt?: number;
@@ -1006,7 +1068,11 @@ async function persistForceClearedEmbeddedRunTerminalState(params: {
 }): Promise<void> {
   try {
     await updateSessionEntry(
-      { sessionKey: params.sessionKey, storePath: params.storePath },
+      {
+        agentId: params.agentId,
+        sessionKey: params.sessionKey,
+        storePath: params.storePath,
+      },
       (storedEntry) => {
         const entry = storedEntry as InternalSessionEntry;
         // A replacement can reuse the session id; bind this patch to both owners' exact snapshot.

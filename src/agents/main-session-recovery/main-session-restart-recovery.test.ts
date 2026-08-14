@@ -27,6 +27,7 @@ import {
 } from "../../infra/agent-events.js";
 import { registerAgentRunContext } from "../../infra/agent-run-registry.js";
 import { moveDeliveryQueueEntryToFailed } from "../../infra/delivery-queue-sqlite.js";
+import { unknownDeliveryTerminalPolicy } from "../../infra/delivery-queue-terminal-policy.js";
 import { OUTBOUND_DELIVERY_QUEUE_NAME } from "../../infra/outbound/delivery-queue-media-staging.js";
 import { ackDelivery, enqueueDeliveryOnce } from "../../infra/outbound/delivery-queue-storage.js";
 import {
@@ -77,6 +78,7 @@ import {
 import * as recoveryOwnerRelease from "./main-session-recovery-owner-release.js";
 import { claimMainSessionRecoveryOwner } from "./main-session-recovery-store.js";
 import { resolveRestartRecoveryStorePaths } from "./main-session-restart-recovery-shared.js";
+import { recoverStore } from "./main-session-restart-recovery-store.js";
 import {
   markRestartAbortedMainSessions,
   markStartupOrphanedMainSessionsForRecovery,
@@ -571,6 +573,53 @@ describe("main-session-restart-recovery", () => {
     });
 
     expect(recovery).toEqual({ recovered: 1, failed: 0, skipped: 0 });
+  });
+
+  it("dispatches a bare fixed-store recovery under its persisted owner", async () => {
+    const storePath = path.join(tmpDir, "shared", "sessions.json");
+    await writeStorePath(storePath, {
+      global: mainSessionEntry({
+        pendingFinalDelivery: makePendingFinalDelivery(),
+        restartRecoveryForceSafeTools: true,
+      }),
+    });
+    const cfg = {
+      agents: {
+        ownership: "explicit",
+        defaults: { sessionStore: { agentId: "ops" } },
+        entries: { ops: {}, research: {} },
+      },
+      session: { scope: "global", store: storePath },
+    } satisfies OpenClawConfig;
+
+    await expect(
+      recoverStore({
+        cfg,
+        gatewayRuntime: mockRecoveryRuntime,
+        resumedSessionKeys: new Set(),
+        storePath,
+      }),
+    ).resolves.toEqual({ recovered: 1, failed: 0, skipped: 0 });
+    expect(gatewayParams()).toMatchObject({ agentId: "ops", sessionKey: "global" });
+  });
+
+  it("dispatches a config-less bare recovery under the legacy implicit owner", async () => {
+    const storePath = path.join(tmpDir, "legacy-shared", "sessions.json");
+    await writeStorePath(storePath, {
+      global: mainSessionEntry({
+        pendingFinalDelivery: makePendingFinalDelivery(),
+        restartRecoveryForceSafeTools: true,
+      }),
+    });
+
+    await expect(
+      recoverStore({
+        gatewayRuntime: mockRecoveryRuntime,
+        resumedSessionKeys: new Set(),
+        storePath,
+      }),
+    ).resolves.toEqual({ recovered: 1, failed: 0, skipped: 0 });
+    expect(gatewayParams()).toMatchObject({ agentId: "main", sessionKey: "global" });
   });
 
   it("persists abort-registry runs after their event context was cleared", async () => {
@@ -2094,7 +2143,12 @@ describe("main-session-restart-recovery", () => {
           tmpDir,
         );
         if (ownerStatus === "failed") {
-          moveDeliveryQueueEntryToFailed(OUTBOUND_DELIVERY_QUEUE_NAME, deliveryId, tmpDir);
+          moveDeliveryQueueEntryToFailed(
+            OUTBOUND_DELIVERY_QUEUE_NAME,
+            deliveryId,
+            unknownDeliveryTerminalPolicy(),
+            tmpDir,
+          );
         } else if (ownerStatus === "completed") {
           await ackDelivery(deliveryId, tmpDir);
         }
@@ -3312,6 +3366,11 @@ describe("main-session-restart-recovery", () => {
 
     await expectRecovery({ recovered: 0, failed: 0, skipped: 1 });
     expect(sendRecoveryNotice).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining("Resume in new session"),
+      }),
+    );
+    expect(sendRecoveryNotice).toHaveBeenCalledWith(
       expect.objectContaining({ text: expect.stringContaining("/new or /reset") }),
     );
     expect(
@@ -3508,7 +3567,7 @@ describe("main-session-restart-recovery", () => {
       to: "discord:dm:main",
       threadId: undefined,
       idempotencyKey: "main-session-restart-recovery:recovery-main:failed-notice",
-      text: expect.stringContaining("/new or /reset"),
+      text: expect.stringContaining("Resume in new session"),
     });
     const failedEntry = loadSessionEntry({ sessionKey: "agent:main:main", storePath });
     expect(failedEntry).toMatchObject({
@@ -3547,7 +3606,7 @@ describe("main-session-restart-recovery", () => {
         content: [
           {
             type: "text",
-            text: expect.stringContaining("/new or /reset"),
+            text: expect.stringContaining("Resume in new session"),
           },
         ],
       },

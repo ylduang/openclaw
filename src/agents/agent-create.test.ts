@@ -72,7 +72,7 @@ import { createAgent } from "./agent-create.js";
 describe("createAgent", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    mocks.config = { agents: { list: [{ id: "main", default: true }] } };
+    mocks.config = { agents: { list: [{ id: "main" }] } };
     mocks.persisted = {};
     mocks.readAgentDeletionJournal.mockReturnValue(undefined);
     mocks.claimCompletedAgentDeletion.mockReturnValue(true);
@@ -97,6 +97,7 @@ describe("createAgent", () => {
       }) => {
         const transformed = (await transform(structuredClone(mocks.config), {
           snapshot: { exists: false },
+          previousHash: null,
         })) as {
           nextConfig: Record<string, unknown>;
           result: unknown;
@@ -166,16 +167,55 @@ describe("createAgent", () => {
     expect((mocks.persisted.agents as { list?: unknown }).list).toBeUndefined();
   });
 
-  it("keeps the first staged roster entry as the default", async () => {
+  it("replaces only the load-time compatibility roster when creating a named first agent", async () => {
+    await createAgent({
+      entry: { id: "robby", name: "robby", workspace: "/tmp/robby" },
+      bootstrapFirstAgent: true,
+    });
+
+    expect(mocks.transformConfigFileWithRetry).toHaveBeenCalledOnce();
+    expect(mocks.transformConfigFileWithRetry).toHaveBeenCalledWith(
+      expect.objectContaining({
+        writeOptions: { allowedAgentRosterRemovals: ["main"] },
+      }),
+    );
+    expect(mocks.persisted).toMatchObject({
+      agents: { entries: { robby: expect.objectContaining({ workspace: "/tmp/robby" }) } },
+    });
+    expect(
+      (mocks.persisted.agents as { entries?: Record<string, unknown> }).entries,
+    ).not.toHaveProperty("main");
+  });
+
+  it("rejects first-agent creation when the approved config hash changed under the lock", async () => {
+    mocks.transformConfigFileWithRetry.mockImplementationOnce(async ({ transform }) =>
+      transform(structuredClone(mocks.config), {
+        snapshot: { exists: true },
+        previousHash: "concurrent",
+      }),
+    );
+
+    await expect(
+      createAgent({
+        entry: { id: "robby", name: "robby", workspace: "/tmp/robby" },
+        bootstrapFirstAgent: true,
+        expectedConfigHash: "approved",
+      }),
+    ).rejects.toThrow("config changed before first-agent creation");
+
+    expect(mocks.ensureAgentWorkspace).not.toHaveBeenCalled();
+  });
+
+  it("keeps the first staged roster entry marker-free", async () => {
     mocks.config = { agents: { list: [] } };
 
     await createAgent({
       entry: { id: "researcher", name: "Researcher", default: false },
     });
 
-    expect(mocks.persisted).toMatchObject({
-      agents: { entries: { researcher: expect.objectContaining({ default: true }) } },
-    });
+    expect(
+      (mocks.persisted.agents as { entries?: Record<string, unknown> })?.entries?.researcher,
+    ).not.toHaveProperty("default");
   });
 
   it.each([
@@ -224,7 +264,7 @@ describe("createAgent", () => {
     mocks.config = {
       agents: {
         list: [
-          { id: "main", default: true, name: "Main" },
+          { id: "main", name: "Main" },
           { id: "ops", name: "Ops" },
         ],
       },
@@ -237,7 +277,7 @@ describe("createAgent", () => {
     expect(mocks.persisted).toMatchObject({
       agents: {
         entries: {
-          main: { default: true, name: "Main" },
+          main: { name: "Main" },
           ops: { name: "Ops" },
           researcher: expect.objectContaining({ model: "openai/gpt-5.5" }),
         },
@@ -252,9 +292,9 @@ describe("createAgent", () => {
         entry: {
           id: "main",
           name: "main",
-          default: true,
           workspace: "/tmp/main-work",
         },
+        bootstrapMain: true,
       }),
     ).resolves.toMatchObject({ status: "existing", agentId: "main" });
     expect(mocks.ensureAgentWorkspace).toHaveBeenCalledOnce();
@@ -266,14 +306,15 @@ describe("createAgent", () => {
   it("does not overwrite an already materialized main agent", async () => {
     mocks.config = {
       agents: {
-        list: [{ id: "main", default: true, name: "Existing", workspace: "/tmp/existing" }],
+        list: [{ id: "main", name: "Existing", workspace: "/tmp/existing" }],
       },
     };
     mocks.resolveAgentWorkspaceDir.mockReturnValueOnce("/tmp/existing");
 
     await expect(
       createAgent({
-        entry: { id: "main", name: "Replacement", default: true, workspace: "/tmp/new" },
+        entry: { id: "main", name: "Replacement", workspace: "/tmp/new" },
+        bootstrapMain: true,
       }),
     ).resolves.toMatchObject({
       status: "existing",
@@ -295,50 +336,44 @@ describe("createAgent", () => {
 
     await expect(
       createAgent({
-        entry: { id: "main", default: true, workspace: "/tmp/replacement" },
+        entry: { id: "main", workspace: "/tmp/replacement" },
+        bootstrapMain: true,
       }),
     ).resolves.toMatchObject({ status: "existing", workspace: "/tmp/persisted" });
     expect(mocks.ensureAgentWorkspace).not.toHaveBeenCalled();
   });
 
-  it("rejects a default marker when a roster already exists", async () => {
-    const before = structuredClone(mocks.config);
-
+  it("drops a deprecated staged default marker", async () => {
     await expect(
-      createAgent({
-        entry: { id: "researcher", name: "Researcher", default: true },
-      }),
-    ).resolves.toMatchObject({
-      status: "error",
-      reason: "default-conflict",
-      message: expect.stringContaining("Reassign the default separately"),
-    });
-    expect(mocks.config).toEqual(before);
-    expect(mocks.persisted).toEqual({});
-    expect(mocks.ensureAgentWorkspace).not.toHaveBeenCalled();
+      createAgent({ entry: { id: "researcher", name: "Researcher", default: true } }),
+    ).resolves.toMatchObject({ status: "created", agentId: "researcher" });
+    expect(
+      (mocks.persisted.agents as { entries?: Record<string, unknown> })?.entries?.researcher,
+    ).not.toHaveProperty("default");
+    expect(mocks.ensureAgentWorkspace).toHaveBeenCalledOnce();
   });
 
   it("rejects a concurrent non-main roster during main bootstrap", async () => {
     const transformConfig = vi.fn(async ({ transform }) =>
-      transform({ agents: { list: [{ id: "main" }, { id: "ops", default: true }] } }),
+      transform({ agents: { list: [{ id: "main" }, { id: "ops" }] } }),
     );
 
     await expect(
       createAgent({
-        entry: { id: "main", default: true, workspace: "/tmp/main" },
+        entry: { id: "main", workspace: "/tmp/main" },
+        bootstrapMain: true,
         transformConfig,
       }),
     ).resolves.toMatchObject({
-      status: "error",
-      reason: "default-conflict",
-      message: expect.stringContaining("Reassign the default separately"),
+      status: "existing",
+      agentId: "main",
     });
     expect(mocks.ensureAgentWorkspace).not.toHaveBeenCalled();
   });
 
   it("respects skipBootstrap from the current config", async () => {
     mocks.config = {
-      agents: { defaults: { skipBootstrap: true }, list: [{ id: "main", default: true }] },
+      agents: { defaults: { skipBootstrap: true }, list: [{ id: "main" }] },
     };
 
     await createAgent({ name: "researcher", workspace: "/tmp/work" });
@@ -456,7 +491,7 @@ describe("createAgent", () => {
 
   it("claims a recovered completed tombstone only once for an existing roster entry", async () => {
     mocks.config = {
-      agents: { list: [{ id: "main", default: true }, { id: "researcher" }] },
+      agents: { list: [{ id: "main" }, { id: "researcher" }] },
     };
     mocks.readAgentDeletionJournal.mockReturnValue({
       operationId: "delete-1",
@@ -488,7 +523,7 @@ describe("createAgent", () => {
 
   it("rejects a concurrent duplicate from the mutation snapshot", async () => {
     mocks.config = {
-      agents: { list: [{ id: "main", default: true }, { id: "researcher" }] },
+      agents: { list: [{ id: "main" }, { id: "researcher" }] },
     };
 
     await expect(createAgent({ name: "researcher" })).resolves.toMatchObject({
@@ -505,7 +540,7 @@ describe("createAgent", () => {
     });
     const transformConfig = vi.fn(async ({ maxAttempts, transform }) => {
       expect(maxAttempts).toBe(1);
-      return await transform({ agents: { list: [{ id: "main", default: true }] } });
+      return await transform({ agents: { list: [{ id: "main" }] } });
     });
 
     await expect(

@@ -1115,6 +1115,7 @@
                 "group": "Hosting",
                 "pages": [
                   "install/azure",
+                  "install/cloudflare",
                   "install/daytona",
                   "install/digitalocean",
                   "install/docker-vm-runtime",
@@ -1724,6 +1725,7 @@
                       "network",
                       "gateway/pairing",
                       "gateway/discovery",
+                      "gateway/portals",
                       "gateway/bonjour"
                     ]
                   }
@@ -1805,6 +1807,7 @@
                       "cli/backup",
                       "cli/openclaw",
                       "cli/daemon",
+                      "cli/delivery",
                       "cli/doctor",
                       "cli/fleet",
                       "cli/gateway",
@@ -1857,6 +1860,7 @@
                       "cli/browser",
                       "cli/cron",
                       "cli/flows",
+                      "cli/connect",
                       "cli/node",
                       "cli/nodes",
                       "cli/sandbox",
