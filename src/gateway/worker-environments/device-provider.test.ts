@@ -7,7 +7,11 @@ import type { PairedDevice } from "../../infra/device-pairing.types.js";
 import { NODE_WORKER_SUPERVISOR_PROTOCOL_FEATURE } from "../../infra/node-runner-inventory.js";
 import { WorkerProviderError } from "../../plugins/types.js";
 import type { NodeWorkerSupervisorNodeProof } from "../node-registry-private.js";
-import { createDeviceWorkerRuntime } from "./device-provider.js";
+import {
+  bindDeviceWorkerReconciliation,
+  createDeviceWorkerRuntime,
+  reconcileDeviceWorker,
+} from "./device-provider.js";
 
 const DEVICE_ID = "device-session-host";
 const DAY_MS = 24 * 60 * 60 * 1_000;
@@ -69,6 +73,7 @@ function deviceRuntime(params: {
   if (params.listCurrentNodes) {
     runtime.bindNodeTransport({
       listCurrentNodes: params.listCurrentNodes,
+      isCurrent: () => true,
       invoke: async () => ({ ok: false }),
     });
   }
@@ -76,6 +81,17 @@ function deviceRuntime(params: {
 }
 
 describe("device worker provider", () => {
+  it("binds targeted device reconciliation to the active worker service", async () => {
+    const service = {};
+    const reconcile = async (deviceId: string) => [`environment:${deviceId}`];
+
+    await expect(reconcileDeviceWorker(service, DEVICE_ID)).resolves.toEqual([]);
+    bindDeviceWorkerReconciliation(service, reconcile);
+    await expect(reconcileDeviceWorker(service, DEVICE_ID)).resolves.toEqual([
+      `environment:${DEVICE_ID}`,
+    ]);
+  });
+
   it("provisions deterministic node leases only for connected paired session hosts", async () => {
     const provider = deviceRuntime({
       getPairedDevice: async (deviceId) => pairedDevice(deviceId),
