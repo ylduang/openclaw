@@ -7,7 +7,6 @@ import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/st
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { logWarn } from "../logger.js";
 import { getPluginToolMeta, setPluginToolMeta, type PluginToolMcpMeta } from "../plugins/tools.js";
-import { matchesMcpToolFilterPattern } from "./agent-bundle-mcp-filter.js";
 import {
   buildSafeToolName,
   normalizeReservedToolNames,
@@ -21,7 +20,8 @@ import type {
   McpToolCatalog,
   SessionMcpRuntime,
 } from "./agent-bundle-mcp-types.js";
-import { mcpContentBlockToAgentContent } from "./mcp-content.js";
+import { projectMcpCallToolResultContent } from "./mcp-content.js";
+import { isMcpToolAllowed } from "./mcp-tool-filter.js";
 import { buildMcpAppCanvasPayload, fetchMcpAppView } from "./mcp-ui-resource.js";
 import type { AgentToolResult } from "./runtime/index.js";
 import type { AnyAgentTool } from "./tools/common.js";
@@ -100,27 +100,9 @@ function toAgentToolResult(params: {
   toolName: string;
   result: CallToolResult;
 }): AgentToolResult<unknown> {
-  const sourceContent = Array.isArray(params.result.content) ? params.result.content : [];
-  const content: AgentToolResult<unknown>["content"] = sourceContent.map(
-    mcpContentBlockToAgentContent,
-  );
-  const structuredContentBlock =
-    params.result.structuredContent !== undefined
-      ? ({
-          type: "text",
-          text: `structuredContent:\n${JSON.stringify(params.result.structuredContent, null, 2)}`,
-        } as const)
-      : null;
-  // Structured results replace mirrored text, but original non-text blocks
-  // still carry images, linked resources, and audio that the JSON cannot mirror.
-  const normalizedContent: AgentToolResult<unknown>["content"] = structuredContentBlock
-    ? [
-        structuredContentBlock,
-        ...sourceContent
-          .filter((block) => block.type !== "text")
-          .map(mcpContentBlockToAgentContent),
-      ]
-    : content.length > 0
+  const content = projectMcpCallToolResultContent(params.result);
+  const normalizedContent: AgentToolResult<unknown>["content"] =
+    content.length > 0
       ? content
       : ([
           {
@@ -210,15 +192,7 @@ function serverAllowsUtilityTool(
   if ((server.deniedToolNames?.includes(operation) === true) !== sessionDeniedOnly) {
     return false;
   }
-  const include = server.toolFilter?.include ?? [];
-  const exclude = server.toolFilter?.exclude ?? [];
-  if (
-    include.length > 0 &&
-    !include.some((pattern) => matchesMcpToolFilterPattern(pattern, operation))
-  ) {
-    return false;
-  }
-  return !exclude.some((pattern) => matchesMcpToolFilterPattern(pattern, operation));
+  return isMcpToolAllowed(server.toolFilter, operation);
 }
 
 function addMcpUtilityTool(params: {

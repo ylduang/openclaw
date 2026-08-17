@@ -57,12 +57,10 @@ export async function prepareGatewayKernelRequestRuntime(params: {
     nodeUnsubscribeAll,
     hasTalkNodeConnected,
     clients,
+    isConnectionActive,
     watchNodeHttpRuntime,
     sharedGatewaySessionGenerationState,
     resolveSharedGatewaySessionGenerationForRuntimeSnapshot,
-    completeControlUiDeviceAuthMigrationForEffectiveOperator,
-    claimControlUiDeviceAuthMigration,
-    releaseControlUiDeviceAuthMigrationClaim,
     nodeRegistry,
     nodeDesktopService,
     workerEnvironmentService,
@@ -151,6 +149,7 @@ export async function prepareGatewayKernelRequestRuntime(params: {
       nodeUnsubscribeAll,
       hasConnectedTalkNode: hasTalkNodeConnected,
       clients,
+      isConnectionActive,
       invalidateDeviceTransports: watchNodeHttpRuntime.invalidateSessionsForDevice,
       disconnectDeviceTransports: watchNodeHttpRuntime.disconnectSessionsForDevice,
       enforceSharedGatewayAuthGenerationForConfigWrite: (nextConfig: OpenClawConfig) => {
@@ -161,12 +160,6 @@ export async function prepareGatewayKernelRequestRuntime(params: {
           clients,
         });
       },
-      completeControlUiDeviceAuthMigration:
-        completeControlUiDeviceAuthMigrationForEffectiveOperator,
-      claimControlUiDeviceAuthMigration: (deviceId: string) =>
-        claimControlUiDeviceAuthMigration(deviceId, { env: process.env }),
-      releaseControlUiDeviceAuthMigrationClaim: (deviceId: string) =>
-        releaseControlUiDeviceAuthMigrationClaim(deviceId, { env: process.env }),
       nodeRegistry,
       ...(nodeDesktopService ? { nodeDesktopService } : {}),
       ...(workerEnvironmentService ? { workerEnvironmentService } : {}),

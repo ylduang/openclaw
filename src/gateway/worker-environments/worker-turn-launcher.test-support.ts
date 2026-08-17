@@ -94,7 +94,7 @@ export function setWorkerTurnSessionTarget(target: typeof sessionTarget): typeof
 }
 
 type DefaultedWorkerTurnLauncherOption =
-  | "recoverPendingWorkspaceResult"
+  | "reconcileActivePlacement"
   | "redispatchReclaimed"
   | "resolveWorkspacePath"
   | "workspaceOperations";
@@ -104,8 +104,8 @@ export function createWorkerSessionTurnPlacementProvider(
     Partial<Pick<WorkerTurnLauncherOptions, DefaultedWorkerTurnLauncherOption>>,
 ) {
   return createRawWorkerSessionTurnPlacementProvider({
-    recoverPendingWorkspaceResult: async () => {
-      throw new Error("unexpected pending workspace recovery");
+    reconcileActivePlacement: async () => {
+      throw new Error("unexpected active placement reconciliation");
     },
     redispatchReclaimed: async () => {
       throw new Error("unexpected reclaimed placement redispatch");
@@ -321,6 +321,8 @@ export function turn(runId = "run-worker-turn", executionIdentity = false) {
     sessionFile,
     sessionTarget,
     workspaceDir: root,
+    permissionMode: "workspace" as const,
+    sessionRoot: root,
     prompt: "Inspect this workspace",
     timeoutMs: 5_000,
     runId,

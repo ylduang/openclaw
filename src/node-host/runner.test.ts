@@ -741,6 +741,30 @@ describe("runNodeHost", () => {
       });
     });
 
+    options?.onHelloOk?.({
+      protocol: 4,
+      features: {
+        methods: [],
+        events: [],
+        capabilities: [
+          GATEWAY_SERVER_CAPS.NODE_WORKER_BUNDLE_RETENTION,
+          GATEWAY_SERVER_CAPS.NODE_WORKER_BUNDLE_STATUS,
+        ],
+      },
+    } as unknown as Parameters<NonNullable<GatewayClientOptions["onHelloOk"]>>[0]);
+    await vi.waitFor(() => {
+      expect(client?.request).toHaveBeenCalledWith(NODE_RUNNER_INVENTORY_UPDATE_METHOD, {
+        protocolFeatures: [NODE_WORKER_SUPERVISOR_PROTOCOL_FEATURE],
+        workerHost: {
+          enabled: true,
+          capacity: "available",
+          bundlePrewarm: 1,
+          bundleRetention: 1,
+          bundleStatus: 1,
+        },
+      });
+    });
+
     mocks.runnerAvailabilityChanged?.(false);
     await vi.waitFor(() => {
       expect(client?.request).toHaveBeenLastCalledWith(NODE_RUNNER_INVENTORY_UPDATE_METHOD, {
@@ -750,6 +774,7 @@ describe("runNodeHost", () => {
           capacity: "full",
           bundlePrewarm: 1,
           bundleRetention: 1,
+          bundleStatus: 1,
         },
       });
     });
@@ -763,6 +788,7 @@ describe("runNodeHost", () => {
           capacity: "available",
           bundlePrewarm: 1,
           bundleRetention: 1,
+          bundleStatus: 1,
         },
       });
     });
@@ -928,6 +954,7 @@ describe("runNodeHost", () => {
   it.each([
     ConnectErrorDetailCodes.AUTH_TOKEN_MISMATCH,
     ConnectErrorDetailCodes.CLIENT_VERSION_MISMATCH,
+    ConnectErrorDetailCodes.AUTH_IDENTITY_HEADER_REQUIRED,
   ])("closes MCP clients before exiting on terminal reconnect pause %s", async (detailCode) => {
     await expect(runNodeHost({ gatewayHost: "127.0.0.1", gatewayPort: 18789 })).rejects.toThrow(
       "event loop readiness timeout",

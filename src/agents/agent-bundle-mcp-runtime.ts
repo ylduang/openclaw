@@ -1,17 +1,13 @@
 /** Session-scoped MCP runtime catalog loader and transport lifecycle. */
 import { Client, type ClientOptions } from "@modelcontextprotocol/sdk/client/index.js";
-import {
-  StreamableHTTPClientTransport,
-  StreamableHTTPError,
-} from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import {
   ErrorCode,
   McpError,
   type CallToolResult,
   type ClientCapabilities,
+  type ServerCapabilities,
 } from "@modelcontextprotocol/sdk/types.js";
-import type { ServerCapabilities } from "@modelcontextprotocol/sdk/types.js";
 import { redactSensitiveUrlLikeString } from "@openclaw/net-policy/redact-sensitive-url";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
@@ -22,7 +18,6 @@ import { redactToolPayloadText } from "../logging/redact.js";
 import type { PluginManifestRegistry } from "../plugins/manifest-registry.js";
 import { runTasksWithConcurrency } from "../utils/run-with-concurrency.js";
 import { mergeMcpToolCatalogs } from "./agent-bundle-mcp-combined.js";
-import { matchesMcpToolFilterPattern } from "./agent-bundle-mcp-filter.js";
 import {
   completeDeferredSessionMcpRuntimeRetirement,
   disposeAllSessionMcpRuntimes,
@@ -58,6 +53,12 @@ import type {
   SessionMcpRuntimeManager,
 } from "./agent-bundle-mcp-types.js";
 import {
+  connectMcpClient,
+  disposeMcpClient,
+  isStatefulMcpHttpSessionExpired,
+  McpClientConnectTimeoutError,
+} from "./mcp-client-lifecycle.js";
+import {
   normalizeMcpCodexToolAnnotations,
   resolveMcpCodexToolApprovalMode,
 } from "./mcp-codex-tool-approval.js";
@@ -68,7 +69,7 @@ import {
 import { createMcpJsonSchemaValidator } from "./mcp-json-schema-validator.js";
 import { sanitizeMcpMetadataText } from "./mcp-metadata.js";
 import { collectMcpPaginatedItems } from "./mcp-pagination.js";
-import { OpenClawStdioClientTransport } from "./mcp-stdio-transport.js";
+import { isMcpToolAllowed, normalizeMcpToolFilter } from "./mcp-tool-filter.js";
 import { resolveMcpTransport } from "./mcp-transport.js";
 
 type BundleMcpSession = {
@@ -114,11 +115,6 @@ function getBundleMcpTestState(): BundleMcpTestState {
   return state;
 }
 
-type McpToolSelection = {
-  include?: readonly string[];
-  exclude?: readonly string[];
-};
-
 type McpServerBackoffState = {
   session: BundleMcpSession;
   failures: number;
@@ -126,53 +122,6 @@ type McpServerBackoffState = {
 };
 
 export { createMcpJsonSchemaValidator as createBundleMcpJsonSchemaValidator };
-
-async function connectWithTimeout(
-  serverName: string,
-  client: Client,
-  transport: Transport,
-  timeoutMs: number,
-): Promise<void> {
-  const abortController = new AbortController();
-  let timeout: ReturnType<typeof setTimeout> | undefined;
-  let deadlineExpired = false;
-  try {
-    // Client.connect() owns both transport startup and the initialize round trip.
-    // Give the SDK the deadline so initialize is cancelled, while the outer race
-    // also bounds transports whose start() has not reached initialize yet.
-    await Promise.race([
-      client.connect(transport, {
-        signal: abortController.signal,
-        timeout: timeoutMs,
-        maxTotalTimeout: timeoutMs,
-      }),
-      new Promise<never>((_, reject) => {
-        timeout = setTimeout(() => {
-          deadlineExpired = true;
-          abortController.abort();
-          reject(new Error("MCP connect deadline expired"));
-        }, timeoutMs);
-      }),
-    ]);
-  } catch (error) {
-    if (deadlineExpired || (isRecord(error) && error.code === ErrorCode.RequestTimeout)) {
-      if (transport instanceof OpenClawStdioClientTransport) {
-        await transport.forceClose();
-      }
-      // Closing the SDK client settles its pending initialize request. Without
-      // this, later runtime disposal waits its full teardown timeout even though
-      // the stdio child is already dead.
-      await settleWithin(client.close(), Math.min(timeoutMs, 1_000));
-      throw new Error(
-        `MCP server "${serverName}" timed out: did not complete initialize within ${timeoutMs / 1_000}s`,
-        { cause: error },
-      );
-    }
-    throw error;
-  } finally {
-    clearTimeout(timeout);
-  }
-}
 
 function redactMcpDiagnosticError(error: unknown): string {
   return redactToolPayloadText(redactSensitiveUrlLikeString(String(error)));
@@ -271,6 +220,13 @@ function setBundleMcpDisposeTimeoutMsForTest(timeoutMs?: number): void {
       : undefined;
 }
 
+function disposeBundleMcpSession(session: BundleMcpSession): Promise<void> {
+  return disposeMcpClient(
+    session,
+    getBundleMcpTestState().disposeTimeoutMs ?? BUNDLE_MCP_DISPOSE_TIMEOUT_MS,
+  );
+}
+
 function buildMcpClientCapabilities(mcpAppsEnabled: boolean): ClientCapabilities {
   return mcpAppsEnabled
     ? {
@@ -285,14 +241,6 @@ function buildMcpClientOptions(mcpAppsEnabled: boolean): ClientOptions {
   return { capabilities: buildMcpClientCapabilities(mcpAppsEnabled) };
 }
 
-function normalizeStringList(value: unknown): string[] | undefined {
-  if (!Array.isArray(value)) {
-    return undefined;
-  }
-  const entries = value.filter((entry): entry is string => typeof entry === "string");
-  return entries.length > 0 ? entries : undefined;
-}
-
 function normalizeToolUiVisibility(value: unknown): Array<"app" | "model"> | undefined {
   if (!Array.isArray(value)) {
     return undefined;
@@ -301,28 +249,6 @@ function normalizeToolUiVisibility(value: unknown): Array<"app" | "model"> | und
     (entry): entry is "app" | "model" => entry === "app" || entry === "model",
   );
   return [...new Set(normalized)].toSorted();
-}
-
-function getMcpToolSelection(rawServer: unknown): McpToolSelection {
-  if (!isRecord(rawServer) || !isRecord(rawServer.toolFilter)) {
-    return {};
-  }
-  return {
-    include: normalizeStringList(rawServer.toolFilter.include),
-    exclude: normalizeStringList(rawServer.toolFilter.exclude),
-  };
-}
-
-function shouldExposeMcpTool(selection: McpToolSelection, toolName: string): boolean {
-  const include = selection.include ?? [];
-  const exclude = selection.exclude ?? [];
-  if (
-    include.length > 0 &&
-    !include.some((pattern) => matchesMcpToolFilterPattern(pattern, toolName))
-  ) {
-    return false;
-  }
-  return !exclude.some((pattern) => matchesMcpToolFilterPattern(pattern, toolName));
 }
 
 function summarizeServerCapabilities(capabilities: ServerCapabilities | undefined) {
@@ -338,53 +264,6 @@ function summarizeServerCapabilities(capabilities: ServerCapabilities | undefine
       : undefined,
   };
 }
-async function settleWithin(promise: Promise<unknown>, timeoutMs: number): Promise<boolean> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  return await Promise.race([
-    promise.then(
-      () => true,
-      () => true,
-    ),
-    new Promise<void>((resolve) => {
-      timer = setTimeout(() => {
-        resolve();
-      }, timeoutMs);
-      timer.unref?.();
-    }).then(() => false),
-  ]).finally(() => {
-    if (timer) {
-      clearTimeout(timer);
-    }
-  });
-}
-
-async function disposeSession(session: BundleMcpSession) {
-  session.detachStderr?.();
-  const timeoutMs = getBundleMcpTestState().disposeTimeoutMs ?? BUNDLE_MCP_DISPOSE_TIMEOUT_MS;
-  const closed = await settleWithin(
-    (async () => {
-      if (session.transportType === "streamable-http") {
-        await (session.transport as StreamableHTTPClientTransport)
-          .terminateSession()
-          .catch(() => {});
-      }
-      await session.transport.close().catch(() => {});
-      await session.client.close().catch(() => {});
-    })(),
-    timeoutMs,
-  );
-  if (!closed) {
-    // Force-close transport and client so a hung terminateSession() DELETE
-    // gets its AbortSignal triggered by teardown. Stdio owns a process group,
-    // so force it dead before disposal can report completion.
-    const transportClose =
-      session.transport instanceof OpenClawStdioClientTransport
-        ? session.transport.forceClose()
-        : session.transport.close();
-    await settleWithin(Promise.allSettled([transportClose, session.client.close()]), timeoutMs);
-  }
-}
-
 function createDisposedError(sessionId: string): Error {
   return new Error(`bundle-mcp runtime disposed for session ${sessionId}`);
 }
@@ -521,12 +400,20 @@ export function createSessionMcpRuntime(params: {
     if (session.connected) {
       return;
     }
-    session.connectPromise ??= connectWithTimeout(
-      session.serverName,
-      session.client,
-      session.transport,
-      connectionTimeoutMs,
-    )
+    session.connectPromise ??= connectMcpClient({
+      client: session.client,
+      transport: session.transport,
+      timeoutMs: connectionTimeoutMs,
+    })
+      .catch((error: unknown) => {
+        if (error instanceof McpClientConnectTimeoutError) {
+          throw new Error(
+            `MCP server "${session.serverName}" timed out: did not complete initialize within ${connectionTimeoutMs / 1_000}s`,
+            { cause: error },
+          );
+        }
+        throw error;
+      })
       .then(() => {
         session.connected = true;
       })
@@ -544,7 +431,7 @@ export function createSessionMcpRuntime(params: {
     }
     session.retiring = true;
     sessions.delete(serverName);
-    await disposeSession(session);
+    await disposeBundleMcpSession(session);
     return true;
   };
   const localRequestTimeouts = new WeakSet<object>();
@@ -615,12 +502,7 @@ export function createSessionMcpRuntime(params: {
     } catch (error) {
       // A stateful server uses HTTP 404 to invalidate an expired MCP session.
       // Reinitialize a fresh client, but never replay a possibly mutating call.
-      const sessionExpired =
-        session.transportType === "streamable-http" &&
-        session.transport instanceof StreamableHTTPClientTransport &&
-        session.transport.sessionId !== undefined &&
-        error instanceof StreamableHTTPError &&
-        error.code === 404;
+      const sessionExpired = isStatefulMcpHttpSessionExpired(session, error);
       let recycleReason: "expired HTTP session" | "repeated request timeouts" | undefined;
       if (sessionExpired && !requestSignal?.aborted) {
         recycleReason = "expired HTTP session";
@@ -891,13 +773,15 @@ export function createSessionMcpRuntime(params: {
                   ),
                 });
                 failIfDisposed();
-                const selection = getMcpToolSelection(rawServer);
+                const toolFilter = normalizeMcpToolFilter(
+                  isRecord(rawServer) ? rawServer.toolFilter : undefined,
+                );
                 const denialMap = params.toolOverrides?.mcpToolsDeny;
                 const deniedToolNames = new Set(
                   denialMap && Object.hasOwn(denialMap, serverName) ? denialMap[serverName] : [],
                 );
                 const policyEligibleTools = listedTools.filter((tool) =>
-                  shouldExposeMcpTool(selection, tool.name.trim()),
+                  isMcpToolAllowed(toolFilter, tool.name.trim()),
                 );
                 const exposedTools = policyEligibleTools.filter((tool) => {
                   const toolName = tool.name.trim();
@@ -922,14 +806,7 @@ export function createSessionMcpRuntime(params: {
                         },
                       }
                     : {}),
-                  ...(selection.include || selection.exclude
-                    ? {
-                        toolFilter: {
-                          ...(selection.include ? { include: [...selection.include] } : {}),
-                          ...(selection.exclude ? { exclude: [...selection.exclude] } : {}),
-                        },
-                      }
-                    : {}),
+                  ...(toolFilter ? { toolFilter } : {}),
                   ...(deniedToolNames.size > 0
                     ? { deniedToolNames: [...deniedToolNames].toSorted() }
                     : {}),
@@ -1052,7 +929,7 @@ export function createSessionMcpRuntime(params: {
         };
       } catch (error) {
         await Promise.allSettled(
-          Array.from(sessions.values(), (session) => disposeSession(session)),
+          Array.from(sessions.values(), (session) => disposeBundleMcpSession(session)),
         );
         sessions.clear();
         throw error;
@@ -1212,7 +1089,7 @@ export function createSessionMcpRuntime(params: {
       catalogInFlight = undefined;
       const sessionsToClose = Array.from(sessions.values());
       sessions.clear();
-      await Promise.allSettled(sessionsToClose.map((session) => disposeSession(session)));
+      await Promise.allSettled(sessionsToClose.map((session) => disposeBundleMcpSession(session)));
     },
   };
   return runtime;

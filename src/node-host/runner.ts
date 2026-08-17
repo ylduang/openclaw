@@ -1,5 +1,6 @@
 /** CLI runner for node-host stdin/stdout command dispatch. */
 import { isDeepStrictEqual } from "node:util";
+import type { CloudflareAccessCredentials } from "../../packages/gateway-client/src/cloudflare-access.js";
 import {
   GATEWAY_CLIENT_MODES,
   GATEWAY_CLIENT_NAMES,
@@ -16,11 +17,16 @@ import { getMachineDisplayName } from "../infra/machine-name.js";
 import {
   NODE_RUNNER_INVENTORY_UPDATE_METHOD,
   NODE_WORKER_BUNDLE_RETENTION_VERSION,
+  NODE_WORKER_BUNDLE_STATUS_VERSION,
   NODE_WORKER_SUPERVISOR_PROTOCOL_FEATURE,
 } from "../infra/node-runner-inventory.js";
 import { VERSION } from "../version.js";
 import { configureNodeHost, type NodeHostGatewayConfig } from "./config.js";
 import { createNodeHostGatewayCandidateConnection } from "./gateway-candidate-connection.js";
+import {
+  resolveNodeHostCloudflareAccess,
+  type NodeHostCloudflareAccessConfig,
+} from "./gateway-cloudflare-access.js";
 import {
   coerceNodeInvokeCancelPayload,
   coerceNodeInvokeInputPayload,
@@ -34,6 +40,7 @@ type NodeHostRunOptions = {
   gatewayPort: number;
   gatewayTls?: boolean;
   gatewayTlsFingerprint?: string;
+  gatewayCloudflareAccess?: NodeHostCloudflareAccessConfig;
   gatewayCandidates?: NodeHostGatewayConfig[];
   gatewayBootstrapToken?: string;
   preferGatewayBootstrapToken?: boolean;
@@ -82,6 +89,7 @@ const NODE_HOST_EXIT_ON_RECONNECT_PAUSE_CODES: ReadonlySet<string> = new Set([
   ConnectErrorDetailCodes.AUTH_BOOTSTRAP_TOKEN_INVALID,
   ConnectErrorDetailCodes.AUTH_PASSWORD_MISSING,
   ConnectErrorDetailCodes.AUTH_PASSWORD_MISMATCH,
+  ConnectErrorDetailCodes.AUTH_IDENTITY_HEADER_REQUIRED,
   ConnectErrorDetailCodes.CLIENT_VERSION_MISMATCH,
 ]);
 
@@ -219,12 +227,14 @@ export async function runNodeHost(opts: NodeHostRunOptions): Promise<void> {
   // Operator-approved startup is a second authorized entry point for Doctor-owned
   // state migrators. Runtime invokes those owners here and never migrates inline.
   await runStartupMigrations({ log: { info: writeStderrLine, warn: writeStderrLine } });
+  const cfg = getRuntimeConfig();
   const plannedGateway: NodeHostGatewayConfig = {
     host: opts.gatewayHost,
     port: opts.gatewayPort,
-    tls: opts.gatewayTls ?? getRuntimeConfig().gateway?.tls?.enabled ?? false,
+    tls: opts.gatewayTls ?? cfg.gateway?.tls?.enabled ?? false,
     tlsFingerprint: opts.gatewayTlsFingerprint,
     contextPath: opts.gatewayContextPath,
+    cloudflareAccess: opts.gatewayCloudflareAccess,
   };
   const fallbackDisplayName = await getMachineDisplayName();
   const config = await configureNodeHost({
@@ -237,9 +247,38 @@ export async function runNodeHost(opts: NodeHostRunOptions): Promise<void> {
   const nodeId = config.nodeId;
   const displayName = config.displayName ?? fallbackDisplayName;
   const gateway = config.gateway ?? plannedGateway;
-  const gatewayCandidates = opts.gatewayCandidates?.length ? opts.gatewayCandidates : [gateway];
+  const gatewayCandidates = opts.gatewayCandidates?.length
+    ? opts.gatewayCandidates.map((candidate, index) =>
+        index === 0 && gateway.cloudflareAccess && !candidate.cloudflareAccess
+          ? { ...candidate, cloudflareAccess: gateway.cloudflareAccess }
+          : candidate,
+      )
+    : [gateway];
 
-  const cfg = getRuntimeConfig();
+  const plaintextAccessCandidate = gatewayCandidates.find(
+    (candidate) => candidate.cloudflareAccess && candidate.tls !== true,
+  );
+  if (plaintextAccessCandidate) {
+    throw new Error("Cloudflare Access credentials require a TLS Gateway connection");
+  }
+
+  const resolvedCloudflareAccess = await Promise.all(
+    gatewayCandidates.map(
+      async (candidate) =>
+        await resolveNodeHostCloudflareAccess({
+          value: candidate.cloudflareAccess,
+          config: cfg,
+          env: process.env,
+        }),
+    ),
+  );
+  const cloudflareAccessByCandidate = new Map<NodeHostGatewayConfig, CloudflareAccessCredentials>();
+  gatewayCandidates.forEach((candidate, index) => {
+    const credentials = resolvedCloudflareAccess[index];
+    if (credentials) {
+      cloudflareAccessByCandidate.set(candidate, credentials);
+    }
+  });
   const preparedRuntime = await prepareNodeHostRuntime({
     config: cfg,
     env: process.env,
@@ -260,6 +299,7 @@ export async function runNodeHost(opts: NodeHostRunOptions): Promise<void> {
   let gatewayConnectionGeneration = 0;
   let connectedGatewayProtocol = 0;
   let gatewaySupportsBundleRetention = false;
+  let gatewaySupportsBundleStatus = false;
   let optionalPublicationStates = new Map<
     NodeOptionalPublicationMethod,
     NodeOptionalPublicationState
@@ -277,6 +317,7 @@ export async function runNodeHost(opts: NodeHostRunOptions): Promise<void> {
     gatewayHelloReceived = false;
     connectedGatewayProtocol = 0;
     gatewaySupportsBundleRetention = false;
+    gatewaySupportsBundleStatus = false;
     retireOptionalPublications();
   };
 
@@ -477,6 +518,9 @@ export async function runNodeHost(opts: NodeHostRunOptions): Promise<void> {
               ...(gatewaySupportsBundleRetention
                 ? { bundleRetention: NODE_WORKER_BUNDLE_RETENTION_VERSION }
                 : {}),
+              ...(gatewaySupportsBundleRetention && gatewaySupportsBundleStatus
+                ? { bundleStatus: NODE_WORKER_BUNDLE_STATUS_VERSION }
+                : {}),
             }
           : { enabled: false },
       },
@@ -498,6 +542,7 @@ export async function runNodeHost(opts: NodeHostRunOptions): Promise<void> {
 
   const client = createNodeHostGatewayCandidateConnection({
     candidates: gatewayCandidates,
+    cloudflareAccessByCandidate,
     clientOptions: {
       token: token || undefined,
       bootstrapToken: opts.gatewayBootstrapToken,
@@ -544,14 +589,21 @@ export async function runNodeHost(opts: NodeHostRunOptions): Promise<void> {
         void activeRuntime.invoke(payload);
       }
     },
-    onHelloOk: (hello, url, tlsFingerprint) => {
+    onHelloOk: (hello, url, tlsFingerprint, cloudflareAccess) => {
       writeStderrLine(`node host gateway connected: ${url}`);
-      activeRuntime.updateGatewayConnection({ url, ...(tlsFingerprint ? { tlsFingerprint } : {}) });
+      activeRuntime.updateGatewayConnection({
+        url,
+        ...(tlsFingerprint ? { tlsFingerprint } : {}),
+        ...(cloudflareAccess ? { cloudflareAccess } : {}),
+      });
       gatewayConnectionGeneration += 1;
       gatewayHelloReceived = true;
       connectedGatewayProtocol = hello.protocol;
       gatewaySupportsBundleRetention =
         hello.features?.capabilities?.includes(GATEWAY_SERVER_CAPS.NODE_WORKER_BUNDLE_RETENTION) ===
+        true;
+      gatewaySupportsBundleStatus =
+        hello.features?.capabilities?.includes(GATEWAY_SERVER_CAPS.NODE_WORKER_BUNDLE_STATUS) ===
         true;
       retireOptionalPublications();
       optionalPublicationStates = new Map();

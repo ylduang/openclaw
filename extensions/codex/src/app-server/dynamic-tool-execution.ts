@@ -23,9 +23,6 @@ import {
   withDynamicToolTerminalResolution,
 } from "./dynamic-tool-response-state.js";
 import type { CodexDynamicToolBridge } from "./dynamic-tools.js";
-import { resolveCodexToolAbortTerminalReason } from "./tool-abort-terminal-reason.js";
-
-export { resolveCodexToolAbortTerminalReason } from "./tool-abort-terminal-reason.js";
 import {
   isJsonObject,
   type CodexDynamicToolCallParams,
@@ -33,6 +30,9 @@ import {
   type CodexDynamicToolDiagnosticTerminalReason,
   type JsonValue,
 } from "./protocol.js";
+import { resolveCodexToolAbortTerminalReason } from "./tool-abort-terminal-reason.js";
+
+export { resolveCodexToolAbortTerminalReason } from "./tool-abort-terminal-reason.js";
 
 /** Default timeout for Codex dynamic tool calls. */
 const CODEX_DYNAMIC_TOOL_TIMEOUT_MS = 90_000;
@@ -579,7 +579,7 @@ function readConfiguredDynamicToolTimeoutMs(
     );
   }
 
-  if (toolName === "image") {
+  if (toolName === "view_image") {
     const candidates = (config?.tools?.media?.models ?? []).filter(
       (entry) => !entry.capabilities || entry.capabilities.includes("image"),
     );

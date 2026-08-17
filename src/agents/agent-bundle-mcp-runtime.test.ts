@@ -8,8 +8,11 @@ import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { expectDefined } from "@openclaw/normalization-core";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { withTestTimeout } from "../../test/helpers/promise.js";
-import { cleanupTempDirs, makeTempDir } from "../../test/helpers/temp-dir.js";
-import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
+import {
+  cleanupTempDirs,
+  makeTempDir,
+  useAutoCleanupTempDirTracker,
+} from "../../test/helpers/temp-dir.js";
 import { createCombinedSessionMcpRuntime } from "./agent-bundle-mcp-combined.js";
 import {
   completeDeferredSessionMcpRuntimeRetirement,
@@ -5784,12 +5787,6 @@ process.on("SIGINT", shutdown);`,
         } else {
           expect(secondCatalog.servers.slow).toBeDefined();
         }
-        await waitForFileText(
-          slowLogPath,
-          "slow first initialize",
-          LIST_TOOLS_SERVER_LOG_TIMEOUT_MS,
-        );
-
         await expect(runtime.callTool("trigger", "poke", {})).resolves.toMatchObject({
           content: [{ type: "text", text: "poked" }],
           isError: false,
