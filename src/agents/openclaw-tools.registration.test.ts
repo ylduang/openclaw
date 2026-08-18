@@ -2,6 +2,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../config/config.js";
 import { setEmbeddedMode } from "../infra/embedded-mode.js";
+import { createPluginBoardWidgetContentKindRegistrar } from "../plugins/board-widget-content-kinds.js";
+import { createPluginRecord } from "../plugins/loader-records.js";
+import { createEmptyPluginRegistry } from "../plugins/registry-empty.js";
+import { resetPluginRuntimeStateForTest, setActivePluginRegistry } from "../plugins/runtime.js";
 import { withEnv } from "../test-utils/env.js";
 import { isToolWrappedWithBeforeToolCallHook } from "./agent-tools.before-tool-call.js";
 import { applyToolAvailabilityDescriptions } from "./agent-tools.deferred-followup.js";
@@ -15,17 +19,16 @@ import { createOpenClawTools } from "./openclaw-tools.js";
 import {
   collectPresentOpenClawTools,
   shouldIncludeAskUserToolForOpenClawTools,
-  shouldIncludeUpdatePlanToolForOpenClawTools,
+  shouldIncludeProgressCardToolForOpenClawTools,
 } from "./openclaw-tools.registration.js";
 import { textResult, type AnyAgentTool } from "./tools/common.js";
 import { createPdfTool } from "./tools/pdf-tool.js";
-import { createUpdatePlanTool } from "./tools/update-plan-tool.js";
 
 vi.mock("./openclaw-plugin-tools.js", () => ({
   resolveOpenClawPluginToolsForOptions: () => [],
 }));
 
-type UpdatePlanGatingParams = Parameters<typeof shouldIncludeUpdatePlanToolForOpenClawTools>[0];
+type ProgressCardGatingParams = Parameters<typeof shouldIncludeProgressCardToolForOpenClawTools>[0];
 type CreateOpenClawToolsOptions = NonNullable<Parameters<typeof createOpenClawTools>[0]>;
 
 function withDefaultRoster(config: OpenClawConfig | undefined): OpenClawConfig {
@@ -35,9 +38,9 @@ function withDefaultRoster(config: OpenClawConfig | undefined): OpenClawConfig {
   };
 }
 
-function expectUpdatePlanEnabled(params: UpdatePlanGatingParams, expected: boolean): void {
+function expectProgressCardEnabled(params: ProgressCardGatingParams, expected: boolean): void {
   expect(
-    shouldIncludeUpdatePlanToolForOpenClawTools({
+    shouldIncludeProgressCardToolForOpenClawTools({
       ...params,
       config: withDefaultRoster(params.config),
     }),
@@ -78,7 +81,7 @@ function expectToolNamed(
   return tool;
 }
 
-describe("openclaw-tools update_plan gating", () => {
+describe("openclaw-tools progress_card gating", () => {
   afterEach(() => {
     setEmbeddedMode(false);
   });
@@ -100,18 +103,18 @@ describe("openclaw-tools update_plan gating", () => {
     ).toEqual([]);
   });
 
-  it("enables update_plan by default", () => {
-    expectUpdatePlanEnabled({ config: {} as OpenClawConfig }, true);
+  it("enables progress_card by default", () => {
+    expectProgressCardEnabled({ config: {} as OpenClawConfig }, true);
   });
 
-  it("exposes update_plan from default tool construction for every embedded model", () => {
+  it("exposes progress_card from default tool construction for every embedded model", () => {
     const defaultTools = createFastToolNames({
       config: {} as OpenClawConfig,
       modelProvider: "anthropic",
       modelId: "claude-sonnet-4-6",
     });
 
-    expect(defaultTools).toContain("update_plan");
+    expect(defaultTools).toContain("progress_card");
     expect(defaultTools).not.toContain("ask_user");
   });
 
@@ -336,14 +339,13 @@ describe("openclaw-tools update_plan gating", () => {
     expect(expectToolNamed(withSpawn, "agents_list").description).toContain("sessions_spawn");
   });
 
-  it("registers update_plan when explicitly enabled", () => {
+  it("registers progress_card when explicitly enabled", () => {
     const config = { tools: { updatePlan: true } } as OpenClawConfig;
 
-    expectUpdatePlanEnabled({ config }, true);
-    expect(createUpdatePlanTool().displaySummary).toBe("Track short work plan.");
+    expectProgressCardEnabled({ config }, true);
   });
 
-  it("registers update_plan when the runtime allowlist explicitly requests it", () => {
+  it("maps the shipped update_plan allowlist name to progress_card", () => {
     const tools = createFastToolNames({
       config: {} as OpenClawConfig,
       pluginToolAllowlist: ["update_plan"],
@@ -351,15 +353,34 @@ describe("openclaw-tools update_plan gating", () => {
       modelId: "claude-sonnet-4-6",
     });
 
-    expect(tools).toContain("update_plan");
+    expect(tools).toContain("progress_card");
   });
 
-  it("includes update_plan when a config allowlist group includes it", () => {
-    const includeUpdatePlan = shouldIncludeUpdatePlanToolForOpenClawTools({
+  it("includes progress_card when a config allowlist group includes it", () => {
+    const includeProgressCard = shouldIncludeProgressCardToolForOpenClawTools({
       config: { tools: { allow: ["group:agents"] } } as OpenClawConfig,
     });
 
-    expect(includeUpdatePlan).toBe(true);
+    expect(includeProgressCard).toBe(true);
+  });
+
+  it.each([
+    {
+      name: "a configured profile",
+      options: { config: { tools: { profile: "messaging" as const } } },
+    },
+    {
+      name: "the runtime allowlist",
+      options: { runtimeToolAllowlist: ["read"] },
+    },
+  ])("omits progress_card when $name excludes it", ({ options }) => {
+    expect(
+      createFastToolNames({
+        ...options,
+        modelProvider: "openai",
+        modelId: "gpt-5.6-sol",
+      }),
+    ).not.toContain("progress_card");
   });
 
   it("leaves normal deny policy enforcement to the assembled tool set", () => {
@@ -371,11 +392,11 @@ describe("openclaw-tools update_plan gating", () => {
       modelId: "claude-sonnet-4-6",
     });
 
-    expect(tools).not.toContain("update_plan");
+    expect(tools).not.toContain("progress_card");
   });
 
   it("lets an explicit updatePlan false override an allowlist that includes the tool", () => {
-    expectUpdatePlanEnabled(
+    expectProgressCardEnabled(
       { config: { tools: { updatePlan: false, allow: ["update_plan"] } } as OpenClawConfig },
       false,
     );
@@ -687,6 +708,44 @@ describe("gateway client capability tool filtering", () => {
     ).toBe(false);
   });
 
+  it("keeps registered board widgets available without promising inline delivery", () => {
+    const registry = createEmptyPluginRegistry();
+    const record = createPluginRecord({
+      id: "diagram",
+      source: "diagram-fixture",
+      origin: "bundled",
+      enabled: true,
+      configSchema: false,
+    });
+    createPluginBoardWidgetContentKindRegistrar(registry)(record, {
+      kind: "diagram",
+      label: "Diagram",
+      resources: { surface: "diagram", paths: ["/__openclaw__/diagram/app.js"] },
+      validateSource() {},
+      composeDocument: ({ source }) => source,
+    });
+    setActivePluginRegistry(registry);
+
+    try {
+      const tool = expectToolNamed(
+        createOpenClawTools({
+          agentSessionKey: "agent:main:main",
+          clientCaps: ["inline-widgets"],
+          config: {
+            plugins: { entries: { canvas: { config: { host: { enabled: false } } } } },
+          },
+        }),
+        "show_widget",
+      );
+
+      expect(tool.description).toContain(
+        "Inline hosting is disabled; set pin=true to place it on this session's dashboard",
+      );
+    } finally {
+      resetPluginRuntimeStateForTest();
+    }
+  });
+
   it("keeps the core widget tool out when OPENCLAW_SKIP_CANVAS_HOST is set", () => {
     withEnv({ OPENCLAW_SKIP_CANVAS_HOST: "1" }, () => {
       expect(hasTool(createOpenClawTools({ clientCaps: ["inline-widgets"] }), "show_widget")).toBe(
@@ -761,6 +820,12 @@ describe("gateway client capability tool filtering", () => {
           toolConstructionPlan: plan,
         }),
         "show_widget",
+      ),
+    ).toBe(false);
+    expect(
+      hasTool(
+        createOpenClawCodingTools({ messageProvider: "webchat", toolConstructionPlan: plan }),
+        "progress_card",
       ),
     ).toBe(false);
   });

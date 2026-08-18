@@ -7,10 +7,11 @@ import type {
   SidebarWorkboardSnapshot,
 } from "../components/app-sidebar-workboard.ts";
 import { icons } from "../components/icons.ts";
+import { CUSTODIAN_PANEL_TOGGLE_EVENT } from "../components/panel-toggle-contract.ts";
 import { renderSettingsSidebar } from "../components/settings-sidebar.ts";
 import type { ThemeModeChangeDetail } from "../components/theme-mode-toggle.ts";
 import { t } from "../i18n/index.ts";
-import { canCallGatewayMethod, isGatewayMethodAdvertised } from "../lib/gateway-methods.ts";
+import { canCallGatewayMethod } from "../lib/gateway-methods.ts";
 import { readSessionMethodAccess } from "../lib/session-method-access.ts";
 import { normalizeAgentId } from "../lib/sessions/session-key.ts";
 import { isTerminalAvailable } from "../lib/terminal-availability.ts";
@@ -26,6 +27,7 @@ import type { ApplicationContext, ApplicationNavigationOptions } from "./context
 import { resolveControlUiAuthToken } from "./control-ui-auth.ts";
 import { readScopeUpgradeAvailability } from "./device-scope-upgrade.ts";
 import {
+  DEBUG_OVERLAY_ELEMENT,
   ensureOptionalElementForHost,
   isOptionalElementDefined,
   type OptionalCustomElement,
@@ -271,7 +273,8 @@ export function renderApplicationShell(host: ShellViewHost) {
   const browserPanelAvailable = isBrowserPanelAvailable(gatewaySnapshot);
   const desktopPanelAvailable = isDesktopPanelAvailable(gatewaySnapshot);
   const custodianPanelAvailable =
-    gatewayConnected && isGatewayMethodAdvertised(gatewaySnapshot, "openclaw.chat") === true;
+    // Scope-aware to match the store: admin-only, never advertisement alone.
+    canCallGatewayMethod(gatewaySnapshot, "openclaw.chat", "operator.admin");
   const activeRoute = host.routeState.routeId ?? "chat";
   // Chat has an offline outbox, New Session keeps a local draft, and Appearance
   // persists local preference intent for replay. Their server actions are
@@ -352,7 +355,8 @@ export function renderApplicationShell(host: ShellViewHost) {
   const uiSettings = loadSettings();
   // The new-session draft shares the chat layout: full-height pane that owns
   // its scrolling and pins the composer dock to the bottom.
-  const chatLikeRoute = isSessionRouteId(activeRoute) || activeRoute === "new-session";
+  const sessionRoute = isSessionRouteId(activeRoute);
+  const chatLikeRoute = sessionRoute || activeRoute === "new-session";
   const custodianRoute = activeRoute === "custodian";
   if (!settingsTakeover) {
     Object.assign(host.navigationSidebar, {
@@ -395,6 +399,7 @@ export function renderApplicationShell(host: ShellViewHost) {
       refreshRequired: navigationSurfaceHidden ? false : overlaySnapshot.controlUiRefreshRequired,
       onRefresh: () => host.refreshControlUi(),
       onHoldUpdate: () => context.overlays.holdUpdate(),
+      onReviewUpdate: () => host.navigate("updates"),
       onOpenApprovals: () => host.openApprovals(),
       onRetryConnect: () => context.gateway.connect(),
       onOpenNewSession: openNewSession,
@@ -431,6 +436,7 @@ export function renderApplicationShell(host: ShellViewHost) {
         refreshRequired: navigationSurfaceHidden ? false : overlaySnapshot.controlUiRefreshRequired,
         onRefresh: () => host.refreshControlUi(),
         onHoldUpdate: () => context.overlays.holdUpdate(),
+        onReviewUpdate: () => host.navigate("updates"),
         searchQuery: host.settingsSearchQuery,
         searchBlockMatches: settingsSearchBlocks,
         onExit: () => host.exitSettings(),
@@ -468,6 +474,9 @@ export function renderApplicationShell(host: ShellViewHost) {
           .onSlashCommand=${(command: string) => host.handleCommandPaletteSlashCommand(command)}
         ></openclaw-command-palette>`
       : nothing}
+    ${isOptionalElementDefined(DEBUG_OVERLAY_ELEMENT)
+      ? html`<openclaw-debug-overlay></openclaw-debug-overlay>`
+      : nothing}
     <div
       class="shell ${chatLikeRoute ? "shell--chat" : ""} ${navCollapsed
         ? "shell--nav-collapsed"
@@ -498,9 +507,7 @@ export function renderApplicationShell(host: ShellViewHost) {
         : nothing}
       <openclaw-app-topbar
         .basePath=${context.basePath}
-        .searchDisabled=${false}
         .navDrawerOpen=${navDrawerOpen}
-        .onboarding=${onboarding}
         .onOpenPalette=${() => host.openPalette()}
         .onToggleDrawer=${(trigger: HTMLElement) => host.toggleNavigationSurface(trigger)}
       ></openclaw-app-topbar>
@@ -547,6 +554,19 @@ export function renderApplicationShell(host: ShellViewHost) {
                   ${icons.search}
                 </button>
               </openclaw-tooltip>
+              ${navCollapsed && custodianPanelAvailable
+                ? html`<openclaw-tooltip .content=${t("nav.askOpenClaw")}>
+                    <button
+                      type="button"
+                      class="shell-chrome-controls__button shell-chrome-controls__custodian"
+                      aria-label=${t("nav.askOpenClaw")}
+                      @click=${() =>
+                        window.dispatchEvent(new CustomEvent(CUSTODIAN_PANEL_TOGGLE_EVENT))}
+                    >
+                      ${icons.lobster}
+                    </button>
+                  </openclaw-tooltip>`
+                : nothing}
             </div>
           `
         : nothing}
@@ -602,6 +622,7 @@ export function renderApplicationShell(host: ShellViewHost) {
           refreshRequired: overlaySnapshot.controlUiRefreshRequired,
           onRefresh: () => host.refreshControlUi(),
           onHoldUpdate: () => context.overlays.holdUpdate(),
+          onReviewUpdate: () => host.navigate("updates"),
         })}
         ${pageActionsBlocked && gatewaySnapshot.phase !== "reload-required"
           ? html`<div class="connection-action-block" role="status" aria-live="polite">
@@ -621,12 +642,12 @@ export function renderApplicationShell(host: ShellViewHost) {
         .client=${gatewayConnected ? gatewaySnapshot.client : null}
         .available=${terminalAvailable}
         .agentId=${selectedAgentId}
+        .sessionKey=${sessionRoute ? host.activeSessionKey : null}
         .suppressed=${settingsTakeover}
-        .sessionBottomOnly=${isSessionRouteId(activeRoute)}
         .themeMode=${resolveTerminalThemeMode()}
         .basePath=${context.basePath}
       ></openclaw-terminal-panel>
-      ${isSessionRouteId(activeRoute)
+      ${sessionRoute
         ? nothing
         : html`
             <openclaw-browser-panel
@@ -658,6 +679,7 @@ export function renderApplicationShell(host: ShellViewHost) {
             .props=${{
               queue: overlaySnapshot.approvalQueue,
               busy: overlaySnapshot.approvalBusy,
+              canGrant: overlaySnapshot.approvalCanGrant,
               errors: overlaySnapshot.approvalErrors,
               nowMs: overlaySnapshot.approvalNowMs,
               onDecision: (

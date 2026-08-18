@@ -131,7 +131,7 @@ persists the start or invokes the provider. Provider aliases are lookup names
 only and must not be used for this declaration.
 
 Worker providers must also declare their id in `contracts.workerProviders`.
-Core persists durable intent before `provision(profile, operationId, options?)`. Providers validate settings and any optional `options.machineClass` before external allocation and throw `WorkerProviderError` for permanent profile rejection. `provision` must adopt the same lease when the operation id repeats. Providers may expose process-stable picker metadata with `listMachineOptions(profile)`; omit the hook when the profile has no meaningful machine choice. Machine options contain only `id`, `label`, optional `description`, and optional `default` because the host has no authoritative cross-provider CPU, memory, or price source. Providers whose provisioning can legitimately exceed core's five-minute default may return a positive millisecond budget from `resolveProvisionTimeoutMs(profile)`; include acquisition, provider-owned setup, and cleanup in that bound.
+Core persists durable intent before `provision(profile, operationId, options?)`. Providers validate settings and any optional `options.machineClass` before external allocation and throw `WorkerProviderError` for permanent profile rejection. `provision` must adopt the same lease when the operation id repeats. Providers may expose process-stable picker metadata with `listMachineOptions(profile)`; omit the hook when the profile has no meaningful machine choice. Machine options contain only `id`, `label`, optional `description`, and optional `default` because the host has no authoritative cross-provider CPU, memory, or price source. Session-placement providers declare exactly one `supportedExecutionModes` value: `worker-turn` providers return node leases, while `remote-exec` providers return SSH leases. Omission advertises no placement modes while preserving direct environment lifecycle calls. Providers whose provisioning can legitimately exceed core's five-minute default may return a positive millisecond budget from `resolveProvisionTimeoutMs(profile)`; include acquisition, provider-owned setup, and cleanup in that bound.
 Core persists the validated profile settings with the lease and supplies that snapshot to `destroy({ leaseId, profile })`, which must be idempotent, and `inspect({ leaseId, profile })`, which returns `active`, `destroyed`, or `unknown`. This lets providers route lifecycle calls after a gateway restart or named-profile removal. SSH endpoints use a `SecretRef` for `keyRef`, never inline key material, and include a `hostKey` from trusted provisioning output as exactly `algorithm base64`, without a hostname or comment. Core pins `hostKey` and never trusts a key from the first connection. Providers may also return up to 10 ordered, unique `fallbackPorts` (integer ports from 1 through 65535, excluding the primary `port`); core validates and persists those advertised candidates for idempotent probes, content-addressed transfers, receipt/lock-guarded artifact installation, convergent managed-worktree mirroring, and tunnel reconnects. Ambiguous unguarded stateful commands fail closed and are not replayed across candidates. A lease may set `sharedHost: true` when the SSH account also owns unrelated processes; core then avoids host-wide process freezing during workspace reconciliation. Omitted or `false` means a dedicated worker host. Active inspection repeats this fact so core can reconcile provider-owned isolation for leases persisted before the field existed; tunnel startup waits for that first authoritative inspection. A provider that mints a dynamic `keyRef` can implement `resolveSshIdentity({ leaseId, profile, keyRef })`; when present, that resolver is authoritative, while providers without it use the configured generic secret resolver.
 `WorkerLease.desktop` is optional and has the shape `{ protocol: "rfb"; port: number; passwordFilePath?: string; apps?: WorkerDesktopApp[] }`; `passwordFilePath`, when present, must be absolute. Providers report this warm-time capability from `provision`; it cannot be retrofitted onto a live lease. The Gateway reads the password file over the provider's SSH endpoint when needed and never persists the password. `WorkerDesktopApp` is a closed union: `{ id: "browser"; executablePath: string; cdpPort: number }` or `{ id: "terminal"; executablePath: string }`. App ids must be unique, executable paths must be absolute, browser CDP ports must be integers from 1 through 65535, and the list accepts at most eight entries. Core rejects unknown ids and fields.
 Providers with renewable leases can also implement `renew(leaseId)`.
@@ -388,6 +388,17 @@ plugins.
 | `api.session.workflow.sendSessionAttachment(...)`                                    | Bundled-only host-mediated file attachment delivery to the active direct-outbound session route                                                            |
 | `api.session.workflow.scheduleSessionTurn(...)` / `unscheduleSessionTurnsByTag(...)` | Bundled-only Cron-backed scheduled session turns plus tag-based cleanup                                                                                    |
 | `api.session.controls.registerSessionAction(...)`                                    | Typed session actions clients can dispatch through the Gateway                                                                                             |
+| `api.registerBoardWidgetContentKind(...)`                                            | Sandboxed board widget source validation, renderer resources, and document composition                                                                     |
+
+`registerBoardWidgetContentKind(...)` is for plugins that own a declarative
+widget source format. The registration supplies a globally unique lowercase
+`kind`, a short label, one capability-scoped plugin surface plus its renderer
+resource paths, a synchronous `validateSource(source)` callback, and a
+synchronous `composeDocument(...)` callback. Core adds the document shell,
+sandbox, theme, and ticket-bound action bridge. Registrations exist only while
+their plugin is active; invalid, reserved, or duplicate kinds fail plugin load.
+Use `dashboard.dataBindings` and `dashboard.actionVerbs` for host capabilities,
+not for renderer registration.
 
 A `surface: "tab"` descriptor adds a sidebar tab to the Control UI. Active
 plugins' tab descriptors are advertised to dashboard clients in the gateway
@@ -398,6 +409,12 @@ plugins can set `path` to a plugin HTTP route (see
 `icon` is a dashboard icon name hint, `group` picks the sidebar section
 (`control` or `agent`), `order` sorts among plugin tabs, and `requiredScopes`
 hides the tab from connections lacking those operator scopes:
+
+Bundled plugins whose page already has a matching native Control UI route can set
+`placement: "route:<pluginId>"`. The host rejects native-route claims from external
+plugins or from bundled plugins whose ID does not own that route. The sidebar opens
+the native route while the descriptor is present instead of mounting the generic
+plugin-tab page.
 
 For a gateway-protected external tab, register the descriptor `path` under a
 same-plugin `auth: "gateway"` HTTP route. After authenticated bootstrap, the browser gets a
