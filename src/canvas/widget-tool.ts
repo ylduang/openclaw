@@ -1,5 +1,6 @@
 /** Agent-facing inline chat widget tool. */
 import { createHash } from "node:crypto";
+import { asOptionalRecord } from "@openclaw/normalization-core/record-coerce";
 import { Type } from "typebox";
 import type { BoardWidgetPutResult } from "../../packages/gateway-protocol/src/index.js";
 import { optionalStringEnum } from "../agents/schema/string-enum.js";
@@ -9,11 +10,19 @@ import {
   type InProcessGatewayCaller,
 } from "../agents/tools/in-process-gateway.js";
 import { normalizeBoardWidgetDeclared } from "../boards/board-capabilities.js";
+import { formatErrorMessage } from "../infra/errors.js";
 import { assertWidgetHtmlSize, WidgetHtmlInputError } from "../plugin-sdk/widget-html.js";
 import {
   listBoardWidgetContentKinds,
   resolveBoardWidgetContentKind,
 } from "../plugins/board-widget-content-kinds.js";
+import type {
+  WidgetPresentationError,
+  WidgetPresentationSuccess,
+  WidgetPresenter,
+  WidgetPresenterContext,
+  WidgetPresenterDocument,
+} from "../plugins/plugin-registration.types.js";
 import { getActivePluginRegistry } from "../plugins/runtime.js";
 import { getPluginRuntimeGatewayRequestScope } from "../plugins/runtime/gateway-request-scope.js";
 import { createCanvasDocument } from "./documents.js";
@@ -32,7 +41,17 @@ export function hasRegisteredShowWidgetKinds(): boolean {
   return listBoardWidgetContentKinds(currentPluginRegistry()).length > 0;
 }
 
-function showWidgetToolSchema(kinds: readonly string[]) {
+function createShowWidgetToolSchema(
+  kinds: readonly string[],
+  presenters: readonly WidgetPresenter[],
+) {
+  const presenterTargets = presenters.flatMap((presenter) =>
+    presenter.target === "current_channel" ? [] : [presenter.target],
+  );
+  const targets = ["assistant_message", ...presenterTargets] as const;
+  const presenterDescriptions = presenters.flatMap((presenter) =>
+    presenter.target === "current_channel" ? [] : [`${presenter.target}: ${presenter.description}`],
+  );
   return Type.Object({
     title: Type.String(),
     widget_code: Type.String(),
@@ -54,9 +73,19 @@ function showWidgetToolSchema(kinds: readonly string[]) {
     size: optionalStringEnum(["sm", "md", "lg", "xl", "full"] as const, {
       description: "Dashboard size: sm, md, lg, xl, or full",
     }),
-    presentation: optionalStringEnum(["card", "full-bleed", "frameless"] as const, {
-      description: "Pinned dashboard frame: card, full-bleed, or frameless",
-    }),
+    presentation: Type.Optional(
+      Type.Object({
+        target: optionalStringEnum(targets, {
+          description: [
+            "Where to show the widget. assistant_message: inline in chat",
+            ...presenterDescriptions,
+          ].join("; "),
+        }),
+        frame: optionalStringEnum(["card", "full-bleed", "frameless"] as const, {
+          description: "Pinned dashboard frame: card, full-bleed, or frameless",
+        }),
+      }),
+    ),
     after: Type.Optional(
       Type.String({
         pattern: "^[a-z0-9][a-z0-9._-]{0,63}$",
@@ -88,7 +117,83 @@ type ShowWidgetToolOptions = {
   stateDir?: string;
   callGateway?: InProcessGatewayCaller;
   inlineHostEnabled?: boolean;
+  inlineClientAvailable?: boolean;
+  presenters?: readonly WidgetPresenter[];
+  presenterContext?: WidgetPresenterContext;
 };
+
+type WidgetPresentationAttempt =
+  | { ok: true; value: WidgetPresentationSuccess }
+  | { ok: false; error: WidgetPresentationError };
+
+async function presentWidget(params: {
+  presenter?: WidgetPresenter;
+  document: WidgetPresenterDocument;
+  title: string;
+  context: WidgetPresenterContext;
+}): Promise<WidgetPresentationAttempt> {
+  const presenter = params.presenter;
+  if (!presenter) {
+    return {
+      ok: false,
+      error: {
+        code: "no_eligible_node",
+        message: "No widget presenter is registered for this target.",
+      },
+    };
+  }
+  const errorCode = presenter.target === "current_channel" ? "presentation_error" : "node_error";
+  try {
+    const availability = await presenter.availability(params.context);
+    if (!availability.ok) {
+      return availability;
+    }
+    return await presenter.present({
+      document: params.document,
+      title: params.title,
+      context: params.context,
+    });
+  } catch (error) {
+    return {
+      ok: false,
+      error: { code: errorCode, message: formatErrorMessage(error) },
+    };
+  }
+}
+
+export function resolveCurrentChannelWidgetPresenter(
+  presenters: readonly WidgetPresenter[],
+  context: WidgetPresenterContext,
+): Extract<WidgetPresenter, { target: "current_channel" }> | undefined {
+  const matches = presenters.filter(
+    (presenter): presenter is Extract<WidgetPresenter, { target: "current_channel" }> => {
+      if (presenter.target !== "current_channel") {
+        return false;
+      }
+      try {
+        return presenter.match(context);
+      } catch {
+        return false;
+      }
+    },
+  );
+  return matches.length === 1 ? matches[0] : undefined;
+}
+
+function widgetPresentationFailureText(
+  error: WidgetPresentationError,
+  inlineAvailable: boolean,
+): string {
+  const message = /[.!?]$/u.test(error.message) ? error.message : `${error.message}.`;
+  if (!inlineAvailable) {
+    return message;
+  }
+  const nextStep =
+    error.code === "no_eligible_node"
+      ? "Pair a canvas-capable device or open the OpenClaw app, then retry."
+      : "Retry the requested presentation destination when it is available.";
+  return `${message} The widget is available inline here. ${nextStep}`;
+}
 
 function slugWidgetName(title: string): string {
   const slug = title
@@ -139,14 +244,35 @@ function assertPinnedWidgetDocumentSize(html: string): void {
 export function createShowWidgetTool(options: ShowWidgetToolOptions = {}): AnyAgentTool {
   const gatewayCall = options.callGateway ?? callInProcessGatewayTool;
   const inlineHostEnabled = options.inlineHostEnabled !== false;
+  const inlineAvailable = inlineHostEnabled && options.inlineClientAvailable !== false;
   const registeredKinds = listBoardWidgetContentKinds(currentPluginRegistry());
-  const kinds = ["html", ...registeredKinds] as const;
+  const allKinds = ["html", ...registeredKinds] as const;
+  const presenters = options.presenters ?? [];
+  const presenterContext =
+    options.presenterContext ??
+    (options.agentSessionKey ? { sessionKey: options.agentSessionKey } : {});
+  const currentChannelPresenter = resolveCurrentChannelWidgetPresenter(
+    presenters,
+    presenterContext,
+  );
+  const kinds =
+    currentChannelPresenter && !inlineAvailable
+      ? allKinds.filter((kind) => currentChannelPresenter.capabilities.sourceKinds.includes(kind))
+      : allKinds;
+  const advertisedRegisteredKinds = kinds.filter((kind) => kind !== "html");
+  const explicitPresenters = presenters.filter(
+    (presenter) => presenter.target !== "current_channel",
+  );
+  const presenterPrompt =
+    explicitPresenters.length > 0
+      ? " Use presentation.target to choose a registered device surface."
+      : "";
   return {
     label: "Show Widget",
     name: "show_widget",
-    description: `Visual helps? Make widget. Do not wait for ask. Use for comparisons, trends, timelines, flows, hierarchies, dashboards, status, progress, layouts, and choices. Text clearer? Skip. Show a widget on the user's current surface; kind defaults to html${registeredKinds.length ? ` and registered kinds are ${registeredKinds.join(", ")}` : ""}. ${inlineHostEnabled ? "Set pin=true to also place it on this session's dashboard" : "Inline hosting is disabled; set pin=true to place it on this session's dashboard"}; use name for a stable widget id, tab for a tab slug, size sm|md|lg|xl|full, presentation card|full-bleed|frameless, and after for a sibling widget anchor. Pinned widgets may declare capabilities.netOrigins and capabilities.tools for operator approval. HTML widgets are self-contained HTML or SVG. Dashboard host APIs: openclaw.prompt.send(text), openclaw.state.emit(payload), openclaw.data.read(bindingId, params?), and openclaw.cron.trigger(jobId). \`title\` is host metadata. Start directly with content; do not repeat the title or recreate dashboard chrome. HTML is pre-themed with --surface --card --elevated --text --text-strong --muted --border --border-strong --accent --accent-fill --accent-fg --ok --warn --danger --info --radius --font-body --font-mono.`,
-    parameters: showWidgetToolSchema(kinds),
-    requiredClientCaps: SHOW_WIDGET_REQUIRED_CLIENT_CAPS,
+    description: `Visual helps? Make widget. Do not wait for ask. Use for comparisons, trends, timelines, flows, hierarchies, dashboards, status, progress, layouts, and choices. Text clearer? Skip. Show a widget on the user's current surface; kind defaults to html${advertisedRegisteredKinds.length ? ` and registered kinds are ${advertisedRegisteredKinds.join(", ")}` : ""}. ${inlineHostEnabled ? "Set pin=true to also place it on this session's dashboard" : "Inline hosting is disabled; set pin=true to place it on this session's dashboard"}; use name for a stable widget id, tab for a tab slug, size sm|md|lg|xl|full, presentation.frame card|full-bleed|frameless, and after for a sibling widget anchor. Pinned widgets may declare capabilities.netOrigins and capabilities.tools for operator approval. HTML widgets are self-contained HTML or SVG. Dashboard host APIs: openclaw.prompt.send(text), openclaw.state.emit(payload), openclaw.data.read(bindingId, params?), and openclaw.cron.trigger(jobId). \`title\` is host metadata. Start directly with content; do not repeat the title or recreate dashboard chrome. HTML is pre-themed with --surface --card --elevated --text --text-strong --muted --border --border-strong --accent --accent-fill --accent-fg --ok --warn --danger --info --radius --font-body --font-mono.${presenterPrompt}`,
+    parameters: createShowWidgetToolSchema(kinds, explicitPresenters),
+    ...(currentChannelPresenter ? {} : { requiredClientCaps: SHOW_WIDGET_REQUIRED_CLIENT_CAPS }),
     execute: async (_toolCallId, args) => {
       const params = args as Record<string, unknown>;
       const kind = readToolStringParam(params, "kind") ?? "html";
@@ -174,6 +300,9 @@ export function createShowWidgetTool(options: ShowWidgetToolOptions = {}): AnyAg
         throw new WidgetHtmlInputError("pin requires an agent session");
       }
       const widgetCode = rawWidgetCode.trim();
+      const presentation = asOptionalRecord(params.presentation);
+      const requestedTarget =
+        readToolStringParam(presentation ?? {}, "target") ?? "assistant_message";
       const registration =
         kind === "html" ? undefined : resolveBoardWidgetContentKind(currentPluginRegistry(), kind);
       if (kind !== "html" && !registration) {
@@ -188,30 +317,41 @@ export function createShowWidgetTool(options: ShowWidgetToolOptions = {}): AnyAg
           throw new WidgetHtmlInputError(`invalid ${kind} widget source: ${String(error)}`);
         }
       }
-      if (!inlineHostEnabled && !shouldPin) {
+      const currentPresenterSupportsKind =
+        currentChannelPresenter?.target === "current_channel" &&
+        currentChannelPresenter.capabilities.sourceKinds.includes(kind);
+      const wantsCurrentChannel =
+        requestedTarget === "assistant_message" && currentPresenterSupportsKind;
+      const wantsNodePanel = requestedTarget === "node_panel";
+      if (!inlineAvailable && !wantsCurrentChannel && !wantsNodePanel && !shouldPin) {
         throw new WidgetHtmlInputError(
           "inline widget hosting is disabled; set pin=true to place the widget on the session dashboard",
         );
       }
-      const wrappedDocument = inlineHostEnabled
-        ? buildWidgetDocument(
+      if (wantsCurrentChannel && currentChannelPresenter?.target === "current_channel") {
+        const { maxSourceBytes } = currentChannelPresenter.capabilities;
+        if (maxSourceBytes !== undefined) {
+          assertWidgetHtmlSize(rawWidgetCode, maxSourceBytes, { inputName: "widget_code" });
+        }
+      }
+      const composedWidget = registration
+        ? registration.definition.composeDocument({
+            source: widgetCode,
             title,
-            registration
-              ? registration.definition.composeDocument({
-                  source: widgetCode,
-                  title,
-                  resourceUrls: Object.fromEntries(
-                    registration.definition.resources.paths.map((resourcePath) => [
-                      resourcePath,
-                      resourcePath,
-                    ]),
-                  ),
-                  promptGranted: false,
-                })
-              : widgetCode,
-            registration ? { scriptOrigins: ["'self'"] } : {},
-          )
-        : undefined;
+            resourceUrls: Object.fromEntries(
+              registration.definition.resources.paths.map((resourcePath) => [
+                resourcePath,
+                resourcePath,
+              ]),
+            ),
+            promptGranted: false,
+          })
+        : widgetCode;
+      const wrappedDocument = buildWidgetDocument(
+        title,
+        composedWidget,
+        registration ? { scriptOrigins: ["'self'"] } : {},
+      );
       let pinnedText = "";
       let pinnedWidgetName: string | undefined;
       if (pinSessionKey) {
@@ -220,7 +360,7 @@ export function createShowWidgetTool(options: ShowWidgetToolOptions = {}): AnyAg
         const name = explicitName ?? slugWidgetName(title);
         const tab = readToolStringParam(params, "tab");
         const size = readToolStringParam(params, "size");
-        const presentation = readToolStringParam(params, "presentation");
+        const frame = readToolStringParam(presentation ?? {}, "frame");
         const after = readToolStringParam(params, "after");
         const pinnedTitle = boardWidgetTitle(title);
         if (!registration) {
@@ -239,7 +379,7 @@ export function createShowWidgetTool(options: ShowWidgetToolOptions = {}): AnyAg
           content: registration
             ? { kind: "registered", contentKind: kind, source: widgetCode }
             : { kind: "html", html: widgetCode },
-          ...(presentation ? { presentation } : {}),
+          ...(frame ? { presentation: frame } : {}),
           ...(capabilities ? { declared: capabilities } : {}),
           ...(!explicitName ? { generatedIdentity: generatedWidgetIdentity(title, name) } : {}),
           ...(tab || size || after
@@ -260,39 +400,109 @@ export function createShowWidgetTool(options: ShowWidgetToolOptions = {}): AnyAg
           snapshot.resolvedWidgetName
         }${size ? ` (${size})` : ""}`;
       }
-      if (!wrappedDocument) {
+      const hasPresentationRoute = inlineAvailable || wantsCurrentChannel || wantsNodePanel;
+      if (!hasPresentationRoute) {
         return jsonResult({
           status: "pinned",
           boardWidgetName: pinnedWidgetName,
           text: `Widget ${pinnedText}`,
         });
       }
-      // Pin first: placement validation can fail, and a rejected board write
-      // must not materialize or prune the bounded inline-document store.
-      const document = await createCanvasDocument(
-        {
-          kind: "html_bundle",
+      let document: Awaited<ReturnType<typeof createCanvasDocument>> | undefined;
+      const hostDocument = async () =>
+        (document ??= await createCanvasDocument(
+          {
+            kind: "html_bundle",
+            title,
+            entrypoint: { type: "html", value: wrappedDocument },
+            surface: "assistant_message",
+            retentionScope: resolveRetentionScope(options),
+            // Direct navigation must not run widget script as the Control UI origin.
+            cspSandbox: "scripts",
+          },
+          {
+            stateDir: options.stateDir,
+            maxDocumentsPerScope: WIDGET_MAX_PER_SCOPE,
+          },
+        ));
+
+      let presentationAttempt: WidgetPresentationAttempt | undefined;
+      if (wantsCurrentChannel && currentChannelPresenter) {
+        presentationAttempt = await presentWidget({
+          presenter: currentChannelPresenter,
+          document: { kind: "html", html: wrappedDocument },
           title,
-          entrypoint: { type: "html", value: wrappedDocument },
-          surface: "assistant_message",
-          retentionScope: resolveRetentionScope(options),
-          // Direct navigation must not run widget script as the Control UI origin.
-          cspSandbox: "scripts",
-        },
-        {
-          stateDir: options.stateDir,
-          maxDocumentsPerScope: WIDGET_MAX_PER_SCOPE,
-        },
-      );
+          context: presenterContext,
+        });
+      } else if (wantsNodePanel) {
+        const hosted = await hostDocument();
+        presentationAttempt = await presentWidget({
+          presenter: explicitPresenters.find((presenter) => presenter.target === "node_panel"),
+          document: { kind: "html", html: wrappedDocument, hostedUrl: hosted.entryUrl },
+          title,
+          context: presenterContext,
+        });
+      }
+
+      if (presentationAttempt?.ok && presentationAttempt.value.kind === "message") {
+        const receipt = presentationAttempt.value.receipt;
+        const messageId = receipt.primaryPlatformMessageId ?? receipt.platformMessageIds[0];
+        return jsonResult({
+          kind: "widget",
+          presentation: {
+            target: "current_channel",
+            title,
+            receipt,
+          },
+          ...(pinnedWidgetName ? { boardWidgetName: pinnedWidgetName } : {}),
+          text: `Widget presented in the current channel${messageId ? ` as message ${messageId}` : ""}${pinnedText ? `; ${pinnedText}` : ""}`,
+        });
+      }
+
+      if (presentationAttempt && !presentationAttempt.ok && !inlineAvailable) {
+        const failureText = widgetPresentationFailureText(presentationAttempt.error, false);
+        if (pinnedWidgetName) {
+          return jsonResult({
+            status: "partial",
+            boardWidgetName: pinnedWidgetName,
+            presentation: {
+              target: requestedTarget === "node_panel" ? "node_panel" : "current_channel",
+              status: "failed",
+              error: presentationAttempt.error,
+            },
+            text: `Widget ${pinnedText}, but presentation failed: ${failureText}`,
+          });
+        }
+        throw new WidgetHtmlInputError(`Widget presentation failed: ${failureText}`);
+      }
+
+      const hosted = await hostDocument();
+      const presentedNode =
+        presentationAttempt?.ok && presentationAttempt.value.kind === "node"
+          ? presentationAttempt.value
+          : undefined;
+      const target = presentedNode ? "node_panel" : "assistant_message";
+      const presentationText = presentedNode
+        ? `; presented on ${presentedNode.nodeName ?? presentedNode.nodeId} (${presentedNode.nodeId})`
+        : presentationAttempt && !presentationAttempt.ok
+          ? `; ${widgetPresentationFailureText(presentationAttempt.error, true)}`
+          : "";
       return jsonResult({
         kind: "canvas",
-        presentation: { target: "assistant_message", title, sandbox: "scripts" },
+        presentation: {
+          target,
+          title,
+          sandbox: "scripts",
+          ...(presentedNode
+            ? { node: { id: presentedNode.nodeId, name: presentedNode.nodeName } }
+            : {}),
+        },
         view: {
-          id: document.id,
-          url: document.entryUrl,
+          id: hosted.id,
+          url: hosted.entryUrl,
           ...(pinnedWidgetName ? { boardWidgetName: pinnedWidgetName } : {}),
         },
-        text: `Widget hosted at ${document.entryUrl}${pinnedText ? `; ${pinnedText}` : ""}`,
+        text: `Widget hosted at ${hosted.entryUrl}${pinnedText ? `; ${pinnedText}` : ""}${presentationText}`,
       });
     },
   };
