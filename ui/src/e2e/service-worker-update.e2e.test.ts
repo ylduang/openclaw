@@ -448,9 +448,16 @@ describe("Control UI service-worker production update E2E", () => {
           "catalog" in request.params,
       );
       expect(catalogOpensBeforeWorkerActivation.length).toBeLessThanOrEqual(1);
+      if (catalogOpensBeforeWorkerActivation.length > 0) {
+        const currentConnect = (await gateway.getRequests("connect")).at(-1);
+        expect(currentConnect?.params).toMatchObject({ client: { buildId: buildB } });
+      }
       installGate.release();
       await reloaded;
       await ensureControlledPage(page, pageErrors, buildB);
+      await expect
+        .poll(async () => (await gateway.getRequests("connect")).at(-1)?.params)
+        .toMatchObject({ client: { buildId: buildB } });
       await expect.poll(() => readWorkerUpdateVersions(page)).toContain(buildB);
 
       const terminal = page.locator("openclaw-terminal-panel[embedded]");
@@ -499,6 +506,18 @@ describe("Control UI service-worker production update E2E", () => {
         sha256: assetB.sha256,
       });
       expect(refreshedAsset.sha256).not.toBe(initialAsset.sha256);
+      await expect
+        .poll(() =>
+          page.evaluate(
+            async ({ assetPath, cacheName }) => {
+              const cache = await caches.open(cacheName);
+              const shell = await cache.match(new URL("./", window.location.origin));
+              return shell ? (await shell.text()).includes(assetPath) : false;
+            },
+            { assetPath: assetB.path, cacheName: `openclaw-control-${buildB}` },
+          ),
+        )
+        .toBe(true);
 
       if (captureUiProof) {
         await page.screenshot({
