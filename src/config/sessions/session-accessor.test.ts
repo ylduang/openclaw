@@ -39,6 +39,7 @@ import {
   deleteSessionEntryLifecycle,
   findTranscriptEvent,
   ensureSessionEntrySync,
+  listSessionChildEntriesReadOnly,
   listSessionEntriesCore,
   listSessionEntriesByStatus,
   listSessionTranscriptInstances,
@@ -592,6 +593,36 @@ describe("session accessor seam", () => {
       [header, older, newer],
     );
 
+    const databasePath = expectDefined(
+      resolveSqliteTargetFromSessionStorePath(storePath, { agentId: "main" }).path,
+      "transcript find database path",
+    );
+    const database = openOpenClawAgentDatabase({ agentId: "main", path: databasePath });
+    const originalPrepare = database.db.prepare.bind(database.db);
+    let transcriptRowsRead = 0;
+    // Count SQLite rows rather than matcher calls: eager materialization happens before matching.
+    const prepareSpy = vi.spyOn(database.db, "prepare").mockImplementation((sql) => {
+      const statement = originalPrepare(sql);
+      return new Proxy(statement, {
+        get(target, property) {
+          if (property === "iterate") {
+            return (...params: Parameters<typeof target.iterate>) => {
+              const iterator = target.iterate(...params);
+              return (function* () {
+                for (const row of iterator) {
+                  if ("event_json" in row) {
+                    transcriptRowsRead += 1;
+                  }
+                  yield row;
+                }
+              })() as ReturnType<typeof target.iterate>;
+            };
+          }
+          const value = Reflect.get(target, property, target) as unknown;
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+    });
     const seen: unknown[] = [];
     const found = await findTranscriptEvent(
       { sessionId: "session-find", sessionKey: "agent:main:main", storePath },
@@ -599,10 +630,11 @@ describe("session accessor seam", () => {
         seen.push(event);
         return (event as { type?: string }).type === "message";
       },
-    );
+    ).finally(() => prepareSpy.mockRestore());
     // Newest-first with early exit: the older message is never visited.
     expect(found).toEqual({ event: newer });
     expect(seen).toEqual([newer]);
+    expect(transcriptRowsRead).toBe(1);
 
     await replaceTranscriptEvents(
       { agentId: "main", sessionId: "session-falsy", sessionKey: "agent:main:falsy", storePath },
@@ -974,12 +1006,25 @@ describe("session accessor seam", () => {
     expect(fs.existsSync(storePath)).toBe(false);
   });
 
-  it("does not parse unrelated blobs across canonical candidate and transcript reads", async () => {
+  it("does not parse unrelated blobs across focused child, candidate, and transcript reads", async () => {
     const sessionKey = "agent:main:focused-session";
     await upsertSessionEntryCore(
       { agentId: "main", sessionKey, storePath },
       { sessionId: "focused-session", updatedAt: 42 },
     );
+    for (const [childSessionKey, lineage] of [
+      ["agent:main:focused-both-child", { spawnedBy: sessionKey }],
+      ["agent:main:focused-parent-child", { parentSessionKey: sessionKey }],
+      [
+        "agent:main:focused-spawned-child",
+        { parentSessionKey: "agent:main:other-parent", spawnedBy: sessionKey },
+      ],
+    ] as const) {
+      await upsertSessionEntryCore(
+        { agentId: "main", sessionKey: childSessionKey, storePath },
+        { ...lineage, sessionId: childSessionKey, updatedAt: 43 },
+      );
+    }
     const databasePath = expectDefined(
       resolveSqliteTargetFromSessionStorePath(storePath, { agentId: "main" }).path,
       "focused session database path",
@@ -994,6 +1039,16 @@ describe("session accessor seam", () => {
 
     const parse = vi.spyOn(JSON, "parse");
     try {
+      expect(
+        listSessionChildEntriesReadOnly({ agentId: "main", sessionKey, storePath }).map(
+          (child) => child.sessionKey,
+        ),
+      ).toEqual([
+        "agent:main:focused-both-child",
+        "agent:main:focused-parent-child",
+        "agent:main:focused-spawned-child",
+      ]);
+      expect(parse.mock.calls.filter(([value]) => value === unrelatedEntryJson)).toHaveLength(0);
       expect(
         resolveSessionEntrySelection({ agentId: "main", sessionKey, storePath }),
       ).toMatchObject({
@@ -3180,6 +3235,7 @@ describe("session accessor seam", () => {
       try {
         result = await persistSessionTranscriptTurn(scope, {
           ...(guarded ? { expectedSessionId: scope.sessionId } : {}),
+          runId: "run-ordered-turn",
           messages: [
             {
               message: {
@@ -3242,6 +3298,7 @@ describe("session accessor seam", () => {
           },
           messageId: result.messages[1]?.messageId,
           messageSeq: 3,
+          runId: "run-ordered-turn",
         },
       ]);
       expect(internalUpdates).toEqual([
