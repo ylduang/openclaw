@@ -11,6 +11,7 @@ import { t } from "../i18n/index.ts";
 import { normalizeAgentLabel } from "../lib/agents/display.ts";
 import { buildExternalLinkRel, EXTERNAL_LINK_TARGET } from "../lib/external-link.ts";
 import { openExternalUrlSafe } from "../lib/open-external-url.ts";
+import type { PresenceViewer } from "../lib/presence-users.ts";
 import { normalizeAgentId } from "../lib/sessions/session-key.ts";
 import {
   DEBUG_OVERLAY_SHORTCUT_LABEL,
@@ -19,6 +20,7 @@ import {
 import { renderAgentSelectAvatar, renderAgentSelectCopy } from "./agent-select.ts";
 import { icons, type IconName } from "./icons.ts";
 import "./sidebar-build-chip.ts";
+import "./viewer-facepile.ts";
 import {
   consumeDropdownKeyboardDismissal,
   syncDropdownItemRadio,
@@ -46,8 +48,6 @@ const IDENTITY_MENU_LINKS: ReadonlyArray<{
   },
 ];
 
-/** Above this roster size the chip menu adds filtering and scrolls the grid. */
-const QUICK_SWITCH_VISIBLE_AGENT_LIMIT = 6;
 const AGENT_VALUE_PREFIX = "agent:";
 const COMMAND_VALUE_PREFIX = "command:";
 const LINK_VALUE_PREFIX = "link:";
@@ -175,13 +175,10 @@ type SidebarAgentMenuParams = {
   activeName: string;
   agents: readonly AgentMenuAgent[];
   identities: ReadonlyMap<string, AgentIdentityResult>;
-  filter: string;
   pinnedAgentIds: readonly string[];
   connected: boolean;
   openMode: "hover" | "click";
   agentUnreadCount: (agentId: string) => number;
-  agentApprovalCount: (agentId: string) => number;
-  onFilterChange: (next: string) => void;
   onPointerEnter: () => void;
   onPointerLeave: () => void;
   onAfterShow: () => void;
@@ -197,8 +194,7 @@ type SidebarIdentityMenuParams = {
   canPairDevice: boolean;
   basePath: string;
   gatewayVersion: string | null;
-  selfName?: string;
-  selfEmail?: string;
+  profileViewer?: PresenceViewer;
   offline: boolean;
   themeMode: ThemeMode;
   triggerWidth: number;
@@ -213,14 +209,9 @@ function isApplePlatform(): boolean {
   return /Mac|iPhone|iPad|iPod/u.test(globalThis.navigator?.platform ?? "");
 }
 
-/** Rows for the chip switcher. Small rosters list everything; larger rosters
-    add filtering while keeping every unpinned option reachable by scrolling. */
 function sidebarAgentMenuRows(params: {
   agents: readonly AgentMenuAgent[];
-  activeId: string;
-  filter: string;
   pinnedAgentIds: readonly string[];
-  identities: ReadonlyMap<string, AgentIdentityResult>;
 }) {
   const { agents } = params;
   const availableIds = new Set(agents.map((agent) => normalizeAgentId(agent.id)));
@@ -229,26 +220,11 @@ function sidebarAgentMenuRows(params: {
       .map((agentId) => normalizeAgentId(agentId))
       .filter((agentId) => availableIds.has(agentId)),
   );
-  const sorted = agents.toSorted((a, b) => {
+  return agents.toSorted((a, b) => {
     const aPinned = pinnedIds.has(normalizeAgentId(a.id)) ? 0 : 1;
     const bPinned = pinnedIds.has(normalizeAgentId(b.id)) ? 0 : 1;
     return aPinned - bPinned;
   });
-  if (agents.length <= QUICK_SWITCH_VISIBLE_AGENT_LIMIT) {
-    return { rows: sorted, showFilter: false };
-  }
-  const query = params.filter.trim().toLowerCase();
-  if (query) {
-    const rows = sorted.filter((entry) => {
-      const agentId = normalizeAgentId(entry.id);
-      return (
-        agentId.toLowerCase().includes(query) ||
-        normalizeAgentLabel(entry, params.identities.get(agentId)).toLowerCase().includes(query)
-      );
-    });
-    return { rows, showFilter: true };
-  }
-  return { rows: sorted, showFilter: true };
 }
 
 function renderAgentRow(agent: AgentMenuAgent, params: SidebarAgentMenuParams) {
@@ -257,11 +233,6 @@ function renderAgentRow(agent: AgentMenuAgent, params: SidebarAgentMenuParams) {
   const label = normalizeAgentLabel(agent, identity);
   const active = agentId === params.activeId;
   const unread = active ? 0 : params.agentUnreadCount(agentId);
-  const approvals = params.agentApprovalCount(agentId);
-  const approvalLabel = t(
-    approvals === 1 ? "execApproval.agentPendingOne" : "execApproval.agentPending",
-    { count: String(approvals) },
-  );
   const option = { value: agentId, label, agent };
   return html`
     <wa-dropdown-item
@@ -280,14 +251,6 @@ function renderAgentRow(agent: AgentMenuAgent, params: SidebarAgentMenuParams) {
         </span>
         ${renderAgentSelectCopy(option)}
         <span class="sidebar-agent-menu__agent-status">
-          ${approvals > 0
-            ? html`<span
-                class="sidebar-agent-approval-count"
-                aria-label=${approvalLabel}
-                title=${approvalLabel}
-                >${approvals}</span
-              >`
-            : nothing}
           ${unread > 0
             ? html`<span
                 class="session-unread-dot"
@@ -337,7 +300,7 @@ export function renderSidebarAgentMenu(params: SidebarAgentMenuParams) {
     return nothing;
   }
   const { activeId, activeName, agents } = params;
-  const { rows, showFilter } = sidebarAgentMenuRows(params);
+  const rows = sidebarAgentMenuRows(params);
   return html`
     <openclaw-menu-surface>
       <wa-dropdown
@@ -387,13 +350,7 @@ export function renderSidebarAgentMenu(params: SidebarAgentMenuParams) {
           if (params.openMode === "hover") {
             return;
           }
-          if (showFilter) {
-            event.currentTarget
-              .querySelector<HTMLInputElement>(".sidebar-agent-menu__filter input")
-              ?.focus();
-          } else {
-            focusActiveAgentMenuItem(event.currentTarget);
-          }
+          focusActiveAgentMenuItem(event.currentTarget);
         }}
         @keydown=${(event: KeyboardEvent) => {
           if (moveSidebarMenuFocus(event)) {
@@ -429,37 +386,9 @@ export function renderSidebarAgentMenu(params: SidebarAgentMenuParams) {
         ${agents.length > 1
           ? html`
               <div class="sidebar-customize-menu__title">${t("agentChip.agents")}</div>
-              ${showFilter
-                ? html`
-                    <div class="sidebar-agent-menu__filter">
-                      <input
-                        type="text"
-                        .value=${params.filter}
-                        placeholder=${t("agentChip.filterAgents")}
-                        aria-label=${t("agentChip.filterAgents")}
-                        @input=${(event: Event) =>
-                          params.onFilterChange((event.target as HTMLInputElement).value)}
-                        @keydown=${(event: KeyboardEvent) => {
-                          if (moveSidebarMenuFocus(event)) {
-                            return;
-                          }
-                          // Keep editing keys out of Web Awesome's document-level
-                          // menu handler; Escape still dismisses the whole menu.
-                          if (event.key !== "Escape" && event.key !== "Tab") {
-                            event.stopPropagation();
-                          }
-                        }}
-                      />
-                    </div>
-                  `
-                : nothing}
-              ${rows.length > 0
-                ? html`<div class="sidebar-agent-menu__agent-grid">
-                    ${rows.map((entry) => renderAgentRow(entry, params))}
-                  </div>`
-                : html`<div class="sidebar-agent-menu__empty">
-                    ${t("agentChip.noAgentMatches")}
-                  </div>`}
+              <div class="sidebar-agent-menu__agent-grid">
+                ${rows.map((entry) => renderAgentRow(entry, params))}
+              </div>
             `
           : nothing}
         <div class="sidebar-customize-menu__separator" role="separator"></div>
@@ -491,7 +420,11 @@ export function renderSidebarIdentityMenu(params: SidebarIdentityMenuParams) {
   if (!position) {
     return nothing;
   }
-  const profileLabel = params.selfEmail ?? params.selfName;
+  const profileName = params.profileViewer?.name ?? params.profileViewer?.email;
+  const profileEmail =
+    params.profileViewer?.email && params.profileViewer.email !== profileName
+      ? params.profileViewer.email
+      : null;
   return html`
     <openclaw-menu-surface>
       <wa-dropdown
@@ -557,23 +490,42 @@ export function renderSidebarIdentityMenu(params: SidebarIdentityMenuParams) {
           aria-label=${t("profilePage.identity.menuLabel")}
           style="position: fixed; left: ${position.x}px; bottom: ${position.bottom}px; width: 1px; height: 1px; opacity: 0; pointer-events: none;"
         ></button>
-        ${profileLabel
-          ? html`<wa-dropdown-item class="sidebar-identity-menu__header" value="command:profile">
-                ${profileLabel}
+        ${profileName
+          ? html`<wa-dropdown-item
+                class="sidebar-customize-menu__item sidebar-identity-menu__header"
+                value="command:profile"
+              >
+                <span slot="icon" class="sidebar-identity-menu__avatar" aria-hidden="true">
+                  <openclaw-viewer-avatar
+                    .user=${params.profileViewer}
+                    variant="footer"
+                  ></openclaw-viewer-avatar>
+                </span>
+                <span class="sidebar-identity-menu__identity">
+                  <span class="sidebar-identity-menu__name" title=${profileName}
+                    >${profileName}</span
+                  >
+                  ${profileEmail
+                    ? html`<span class="sidebar-identity-menu__email" title=${profileEmail}
+                        >${profileEmail}</span
+                      >`
+                    : nothing}
+                </span>
               </wa-dropdown-item>
               <div class="sidebar-customize-menu__separator" role="separator"></div>`
           : nothing}
         <wa-dropdown-item class="sidebar-customize-menu__item" value="command:settings">
           <span slot="icon" class="nav-item__icon" aria-hidden="true">${icons.settings}</span>
           <span class="sidebar-customize-menu__text">${t("nav.settings")}</span>
-          <span slot="details" class="session-menu__shortcut" aria-hidden="true"
-            >${isApplePlatform() ? "⌘⇧," : "Ctrl+Shift+,"}</span
+          <kbd slot="details" class="session-menu__shortcut" aria-hidden="true"
+            >${isApplePlatform() ? "⌘⇧," : "Ctrl+Shift+,"}</kbd
           >
         </wa-dropdown-item>
         <wa-dropdown-item class="sidebar-customize-menu__item" value="command:usage">
           <span slot="icon" class="nav-item__icon" aria-hidden="true">${icons.coins}</span>
           <span class="sidebar-customize-menu__text">${titleForRoute("usage")}</span>
         </wa-dropdown-item>
+        <div class="sidebar-customize-menu__separator" role="separator"></div>
         <wa-dropdown-item
           class="sidebar-customize-menu__item sidebar-pair-mobile"
           value="command:pair-mobile"
@@ -594,6 +546,7 @@ export function renderSidebarIdentityMenu(params: SidebarIdentityMenuParams) {
             >${DEBUG_OVERLAY_SHORTCUT_LABEL}</span
           >
         </wa-dropdown-item>
+        <div class="sidebar-customize-menu__separator" role="separator"></div>
         <wa-dropdown-item
           class="sidebar-customize-menu__item sidebar-identity-menu__help"
           value="command:help"
@@ -616,6 +569,7 @@ export function renderSidebarIdentityMenu(params: SidebarIdentityMenuParams) {
         <div class="sidebar-customize-menu__separator" role="separator"></div>
         <div class="sidebar-identity-menu__footer">
           <openclaw-sidebar-build-chip
+            .variant=${"identity"}
             .basePath=${params.basePath}
             .gatewayVersion=${params.gatewayVersion}
             .onNavigate=${(routeId: "about") => {
