@@ -23,9 +23,9 @@ import {
 } from "./session-accessor.sqlite-entry-equality.js";
 import {
   clearSessionCollaborationForKey,
+  copySessionNodeArtifactsForRepair,
   deleteSessionDeliveryArtifacts,
   deleteSessionNodeArtifacts,
-  rehomeLegacySessionNodeArtifacts,
 } from "./session-accessor.sqlite-node-artifacts.js";
 import {
   hasSqliteSessionOwnerColumns,
@@ -49,7 +49,7 @@ import {
   hasValidSessionEntryIdentity,
   parseSessionEntryJson as parseSessionEntryRow,
 } from "./session-accessor.sqlite-status.js";
-import { readTranscriptMutationStateInTransaction } from "./session-accessor.sqlite-transcript-state.js";
+import * as transcript from "./session-accessor.sqlite-transcript-state.js";
 import {
   assertCanonicalSessionEntryLineageWrite,
   assertCanonicalSqliteSessionKeysCurrent,
@@ -539,7 +539,9 @@ export function deleteLegacySessionEntryRows(
       continue;
     }
     rehomeSessionWindows(database, sessionKey, [legacyKey]);
-    rehomeLegacySessionNodeArtifacts(database, legacyKey, sessionKey, options);
+    copySessionNodeArtifactsForRepair(database, database, [legacyKey], sessionKey, {
+      includeMembers: options.rehomeMembers,
+    });
     executeSqliteQuerySync(
       database.db,
       db.deleteFrom("session_nodes").where("session_key", "=", legacyKey),
@@ -627,8 +629,8 @@ export function writeSessionEntry(
   // Registry writes snapshot the current transcript watermark so recovery can
   // distinguish same-millisecond transcript writes before and after this row.
   const transcriptObservedAt =
-    readTranscriptMutationStateInTransaction(database, normalizedEntry.sessionId).updatedAt ??
-    updatedAt;
+    transcript.readTranscriptMutationStateInTransaction(database, normalizedEntry.sessionId)
+      .updatedAt ?? updatedAt;
   const boundSessionRoot = bindSessionRoot({ entry: normalizedEntry, sessionKey, updatedAt });
   const conversation = prepareSessionConversationForWrite({
     database,
@@ -726,6 +728,7 @@ export function writeSessionEntry(
         }),
       ),
   );
+  transcript.ensureSessionTranscriptSourceGenerationInTransaction(database, sessionRow.session_id);
   if (conversation) {
     linkSessionConversation({
       database,
@@ -737,5 +740,4 @@ export function writeSessionEntry(
   }
   publishSessionEntryCacheInvalidation(database, sessionNode, writeGeneration);
 }
-
 /** Resolves the parent fork decision using SQLite transcript rows when totals are stale. */
