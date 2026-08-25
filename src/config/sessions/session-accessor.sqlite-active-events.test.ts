@@ -14,12 +14,13 @@ import {
   readSessionTranscriptActivePathEntryRelation,
   readSessionTranscriptActiveStats,
   readSessionTranscriptBoundedMessageTailPage,
-  readSessionTranscriptMessageAnchorPage,
-  readSessionTranscriptMessageEventById,
-  readSessionTranscriptMessageEventCount,
   readSessionTranscriptMessageEventPage,
   SessionTranscriptProjectionUnavailableError,
 } from "./session-accessor.sqlite-active-events.js";
+import {
+  readSessionTranscriptHistoryAnchorPage as readSessionTranscriptMessageAnchorPage,
+  readSessionTranscriptHistoryEventById as readSessionTranscriptMessageEventById,
+} from "./session-accessor.sqlite-history-events.js";
 import { runExclusiveSqliteSessionWrite } from "./session-accessor.sqlite-scope.js";
 import { appendTranscriptEventsInTransaction } from "./session-accessor.sqlite-transcript-store.js";
 import {
@@ -45,6 +46,10 @@ vi.mock("../../shared/store-writer-queue.js", async (importOriginal) => {
 });
 
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
+const readSessionTranscriptMessageEventCount = (
+  scope: Parameters<typeof readSessionTranscriptMessageEventPage>[0],
+): number =>
+  readSessionTranscriptMessageEventPage(scope, { maxMessages: 0, offset: 0 }).totalMessages;
 
 describe("SQLite active transcript event projection", () => {
   let stateDir: string;
@@ -646,7 +651,7 @@ describe("SQLite active transcript event projection", () => {
       touchSessionEntry: false,
     });
     await persistSessionTranscriptTurn(secondScope, {
-      messages: Array.from({ length: 1_000 }, (_, index) => ({
+      messages: Array.from({ length: 5_000 }, (_, index) => ({
         eventId: `slow-${index}`,
         parentId: index === 0 ? null : `slow-${index - 1}`,
         message: { role: "toolResult", content: "slow" },
@@ -800,13 +805,7 @@ describe("SQLite active transcript event projection", () => {
 
   it("skips the preparation worker when the projection is already current", async () => {
     await persistSessionTranscriptTurn(scope, {
-      messages: [
-        {
-          eventId: "seed",
-          maintainDisplayProjection: true,
-          message: { role: "user", content: "seed" },
-        },
-      ],
+      messages: [{ eventId: "seed", message: { role: "user", content: "seed" } }],
       touchSessionEntry: false,
     });
     queuedSessionWrite.mockClear();
@@ -959,15 +958,11 @@ describe("SQLite active transcript event projection", () => {
           `
             INSERT INTO session_transcript_index_state
               (session_id, indexed_seq, leaf_event_id, needs_rebuild,
-               active_event_count, active_message_count, source_generation, updated_at)
-            VALUES (
-              ?, 100000, 'm100000', 0, 100000, 100000,
-              (SELECT generation FROM transcript_rewrite_watermarks WHERE session_id = ?),
-              100000
-            )
+               active_event_count, active_message_count, updated_at)
+            VALUES (?, 100000, 'm100000', 0, 100000, 100000, 100000)
           `,
         )
-        .run(scope.sessionId, scope.sessionId);
+        .run(scope.sessionId);
       database.db.exec("COMMIT;");
     } catch (error) {
       database.db.exec("ROLLBACK;");

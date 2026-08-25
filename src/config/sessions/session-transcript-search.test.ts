@@ -3,11 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  executeSqliteQuerySync,
-  executeSqliteQueryTakeFirstSync,
-  getNodeSqliteKysely,
-} from "../../infra/kysely-sync.js";
+import { executeSqliteQuerySync, getNodeSqliteKysely } from "../../infra/kysely-sync.js";
 import type { DB as OpenClawAgentKyselyDatabase } from "../../state/openclaw-agent-db.generated.js";
 import {
   closeOpenClawAgentDatabasesForTest,
@@ -20,7 +16,14 @@ import {
   appendTranscriptMessage,
   replaceTranscriptEvents,
 } from "./session-accessor.sqlite-transcript-write.js";
-import { listSessionsNeedingTranscriptIndexReconcile } from "./session-transcript-index.js";
+import {
+  listSessionsNeedingTranscriptIndexReconcile,
+  SYNC_REBUILD_MAX_BYTES,
+} from "./session-transcript-index.js";
+import {
+  isSessionTranscriptIndexReconcileRunning,
+  waitForSessionTranscriptIndexReconcile,
+} from "./session-transcript-reconcile.js";
 import { searchSessionTranscripts } from "./session-transcript-search.js";
 
 vi.mock("../config.js", async () => ({
@@ -97,10 +100,7 @@ function agentKysely() {
     kysely: getNodeSqliteKysely<
       Pick<
         OpenClawAgentKyselyDatabase,
-        | "session_transcript_fts"
-        | "session_transcript_index_state"
-        | "transcript_events"
-        | "transcript_rewrite_watermarks"
+        "session_transcript_fts" | "session_transcript_index_state" | "transcript_events"
       >
     >(database.db),
   };
@@ -164,17 +164,47 @@ describe("searchSessionTranscripts", () => {
     expect(() => search("x".repeat(4097))).toThrow(/must not exceed/);
   });
 
-  it("reindexes synchronously when a linear transcript is replaced", async () => {
+  it("preserves stale FTS rows until a replaced transcript is reconciled after commit", async () => {
     await appendUserMessage("session-1", "agent:main:main", "obsolete branch text");
+    const { db, kysely } = agentKysely();
+    const indexedRows = () =>
+      executeSqliteQuerySync(
+        db,
+        kysely
+          .selectFrom("session_transcript_fts")
+          .select(["message_id", "text"])
+          .where("session_id", "=", "session-1"),
+      ).rows;
+    const originalIndexedRows = indexedRows();
+    expect(originalIndexedRows).toEqual([
+      expect.objectContaining({ text: "obsolete branch text" }),
+    ]);
     await replaceTranscriptEvents(transcriptScope("session-1", "agent:main:main"), [
       {
         type: "message",
         id: "m-new",
         parentId: null,
         message: { role: "user", content: [{ type: "text", text: "replacement text" }] },
+        padding: "x".repeat(SYNC_REBUILD_MAX_BYTES),
         timestamp: 1720000000000,
       } as unknown as TranscriptEvent,
     ]);
+
+    expect(indexedRows()).toEqual(originalIndexedRows);
+    expect(
+      executeSqliteQuerySync(
+        db,
+        kysely
+          .selectFrom("session_transcript_index_state")
+          .select("needs_rebuild")
+          .where("session_id", "=", "session-1"),
+      ).rows,
+    ).toEqual([{ needs_rebuild: 1 }]);
+    expect(isSessionTranscriptIndexReconcileRunning({ agentId: "main", env: env() })).toBe(true);
+    expect(search("obsolete")).toMatchObject({ hits: [], indexing: true });
+    expect(search("replacement")).toMatchObject({ hits: [], indexing: true });
+
+    await waitForSessionTranscriptIndexReconcile({ agentId: "main", env: env() });
 
     expect(search("obsolete").hits).toHaveLength(0);
     const result = search("replacement");
@@ -213,24 +243,6 @@ describe("searchSessionTranscripts", () => {
 
     expect(search("beta").hits).toHaveLength(0);
     expect(search("alpha").hits).toHaveLength(1);
-  });
-
-  it("hides same-generation FTS rows until their frontier is current", async () => {
-    await appendUserMessage("session-1", "agent:main:main", "frontier guarded");
-    const { db, kysely } = agentKysely();
-    executeSqliteQuerySync(
-      db,
-      kysely
-        .updateTable("session_transcript_index_state")
-        .set({ indexed_seq: -1 })
-        .where("session_id", "=", "session-1"),
-    );
-
-    const lagging = search("frontier");
-    expect(lagging.indexing).toBe(true);
-    expect(lagging.hits).toEqual([]);
-    await waitForSearchReconcile("frontier");
-    expect(search("frontier").hits).toHaveLength(1);
   });
 
   it("streams large searchable projections to the writer in bounded chunks", async () => {
@@ -273,29 +285,12 @@ describe("searchSessionTranscripts", () => {
     expect(result.hits).toHaveLength(1);
   });
 
-  it("detects missing source, dirty, and lagging transcript index watermarks", async () => {
+  it("detects missing, dirty, and lagging transcript index watermarks", async () => {
     await appendUserMessage("session-1", "agent:main:main", "indexed message");
     const { db, kysely } = agentKysely();
     const pending = () => listSessionsNeedingTranscriptIndexReconcile(db);
 
     expect(pending()).toEqual([]);
-
-    const source = executeSqliteQueryTakeFirstSync(
-      db,
-      kysely
-        .deleteFrom("transcript_rewrite_watermarks")
-        .where("session_id", "=", "session-1")
-        .returning(["generation", "updated_at"]),
-    );
-    expect(pending()).toEqual(["session-1"]);
-    executeSqliteQuerySync(
-      db,
-      kysely.insertInto("transcript_rewrite_watermarks").values({
-        generation: source!.generation,
-        session_id: "session-1",
-        updated_at: source!.updated_at,
-      }),
-    );
 
     executeSqliteQuerySync(
       db,

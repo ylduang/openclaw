@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { uniqueStrings } from "@openclaw/normalization-core/string-normalization";
 import {
   executeSqliteQuerySync,
@@ -13,14 +14,66 @@ import {
   assertCanonicalSessionKeyWriteMatchesDatabase,
   canonicalSessionKeyMigrationRequiredError,
 } from "./session-canonical-key.js";
-import { deleteSessionTranscriptIndexInTransaction } from "./session-transcript-index.js";
 import {
   foldedSessionKeyAliasCandidates,
   normalizeStoreSessionKey,
   resolveDeliveryProvenCanonicalSessionKey,
 } from "./store-entry.js";
 
-export { ensureSessionTranscriptSourceGenerationInTransaction } from "./session-transcript-source-generation.js";
+function createTranscriptGeneration(): string {
+  return randomUUID().replaceAll("-", "");
+}
+
+/** Read the current raw transcript generation inside the caller's transaction. */
+export function readTranscriptGenerationInTransaction(
+  database: OpenClawAgentDatabase,
+  sessionId: string,
+): string | undefined {
+  const db = getSessionKysely(database.db);
+  return executeSqliteQueryTakeFirstSync(
+    database.db,
+    db
+      .selectFrom("transcript_rewrite_watermarks")
+      .select("generation")
+      .where("session_id", "=", sessionId),
+  )?.generation;
+}
+
+/** Materialize a generation once; pure appends must preserve an existing token. */
+export function ensureTranscriptGenerationInTransaction(
+  database: OpenClawAgentDatabase,
+  sessionId: string,
+): string {
+  const db = getSessionKysely(database.db);
+  const generation = createTranscriptGeneration();
+  executeSqliteQuerySync(
+    database.db,
+    db
+      .insertInto("transcript_rewrite_watermarks")
+      .values({ session_id: sessionId, generation, updated_at: Date.now() })
+      .onConflict((conflict) => conflict.column("session_id").doNothing()),
+  );
+  return readTranscriptGenerationInTransaction(database, sessionId) ?? generation;
+}
+
+/** Rotate the watermark in the same transaction as destructive transcript replacement. */
+export function rotateTranscriptGenerationInTransaction(
+  database: OpenClawAgentDatabase,
+  sessionId: string,
+): string {
+  const db = getSessionKysely(database.db);
+  const generation = createTranscriptGeneration();
+  executeSqliteQuerySync(
+    database.db,
+    db
+      .insertInto("transcript_rewrite_watermarks")
+      .values({ session_id: sessionId, generation, updated_at: Date.now() })
+      .onConflict((conflict) =>
+        conflict.column("session_id").doUpdateSet({ generation, updated_at: Date.now() }),
+      ),
+  );
+  return generation;
+}
 
 export function ensureTranscriptSessionRoot(
   database: OpenClawAgentDatabase,
@@ -236,7 +289,5 @@ export function deleteTranscriptEventsInTransaction(
     database.db,
     db.deleteFrom("transcript_events").where("session_id", "=", sessionId),
   );
-  // FTS rows have no FK onto transcript_events; clear them in this transaction.
-  deleteSessionTranscriptIndexInTransaction(database.db, sessionId);
   return (result.numAffectedRows ?? 0n) > 0n;
 }
