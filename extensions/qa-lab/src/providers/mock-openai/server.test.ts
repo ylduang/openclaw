@@ -4743,18 +4743,27 @@ Update and merge these partial structured summaries.`,
     }
   });
 
-  it("answers heartbeat prompts without spawning extra subagents", async () => {
+  it.each([
+    {
+      name: "legacy workspace heartbeat",
+      prompt:
+        "System: Gateway restart config-apply ok\nSystem: QA-SUBAGENT-RECOVERY-1234\n\nRead HEARTBEAT.md if it exists (workspace context). Follow it strictly. Do not infer or repeat old tasks from prior chats. If nothing needs attention, reply HEARTBEAT_OK.",
+      reply: "HEARTBEAT_OK",
+    },
+    {
+      name: "automation heartbeat",
+      prompt:
+        "System: Gateway restart config-apply ok\n\nFollow the heartbeat monitor scratch context when provided. If nothing needs attention, reply NO_REPLY.",
+      reply: "NO_REPLY",
+    },
+  ])("answers $name prompts without spawning extra subagents", async ({ prompt, reply }) => {
     const server = await startMockServer();
 
     const response = await expectNonStreamingResponses(server, {
-      input: [
-        makeUserInput(
-          "System: Gateway restart config-apply ok\nSystem: QA-SUBAGENT-RECOVERY-1234\n\nRead HEARTBEAT.md if it exists (workspace context). Follow it strictly. Do not infer or repeat old tasks from prior chats. If nothing needs attention, reply HEARTBEAT_OK.",
-        ),
-      ],
+      input: [makeUserInput(prompt)],
     });
 
-    expect(outputText(await response.json())).toBe("HEARTBEAT_OK");
+    expect(outputText(await response.json())).toBe(reply);
   });
 
   it("returns exact markers for visible and hot-installed skills", async () => {
@@ -8188,6 +8197,22 @@ Update and merge these partial structured summaries.`,
       ],
     });
     expect(outputText(recovered)).toBe(
+      "The requested file could not be read: ENOENT. QA-FAILED-TOOL-FINALIZED-OK",
+    );
+
+    const reconciled = await expectNonStreamingResponsesJson<{
+      output?: Array<{ content?: Array<{ text?: string }> }>;
+    }>(server, {
+      model: "gpt-5.6-luna",
+      input: [
+        makeUserInput(prompt),
+        makeUserInput(
+          "The previous Code Mode mutation may have partially applied. Do not repeat or finish any mutation. Use only the available read-only inspection tools to determine the authoritative current state, then report exactly what applied, what did not, what remains unknown, and what work is still required.",
+        ),
+        failedToolOutput,
+      ],
+    });
+    expect(outputText(reconciled)).toBe(
       "The requested file could not be read: ENOENT. QA-FAILED-TOOL-FINALIZED-OK",
     );
   });
