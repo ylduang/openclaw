@@ -1,3 +1,4 @@
+import type { NormalizeReplySkipReason } from "../../auto-reply/reply/normalize-reply.js";
 import {
   HEARTBEAT_IDLE_RETRY_GRACE_MS,
   HEARTBEAT_SKIP_CRON_IN_PROGRESS,
@@ -45,6 +46,7 @@ export async function executeJobCore(
       delivered?: boolean;
       deliveryAttempted?: boolean;
       deliveryError?: string;
+      deliverySuppressionReason?: NormalizeReplySkipReason;
       delivery?: CronDeliveryTrace;
       nextCheck?: CronNextCheckProposal;
       scriptStateChanged?: boolean;
@@ -324,18 +326,19 @@ async function executeMainSessionCronJob(
         heartbeatResult.reason === HEARTBEAT_SKIP_CRON_IN_PROGRESS
           ? maxWaitMs
           : state.deps.nowMs() - waitStartedAt;
-      if (elapsedMs >= maxWaitMs) {
-        requestCronHeartbeat(state, heartbeatWake);
+      const delayMs =
+        heartbeatResult.retryAtMs !== undefined
+          ? Math.max(0, heartbeatResult.retryAtMs - state.deps.nowMs())
+          : heartbeatResult.reason === HEARTBEAT_SKIP_PREEMPTED
+            ? HEARTBEAT_IDLE_RETRY_GRACE_MS
+            : retryDelayMs;
+      // A caller's wait budget cannot shorten the runner's retry deadline.
+      // Hand unfinished work to the wake owner with its original retry facts.
+      if (elapsedMs >= maxWaitMs || delayMs > maxWaitMs - elapsedMs) {
+        requestCronHeartbeat(state, heartbeatWake, heartbeatResult);
         return { status: "ok", summary: text };
       }
-      await waitWithAbort(
-        Math.min(
-          heartbeatResult.reason === HEARTBEAT_SKIP_PREEMPTED
-            ? HEARTBEAT_IDLE_RETRY_GRACE_MS
-            : retryDelayMs,
-          maxWaitMs - elapsedMs,
-        ),
-      );
+      await waitWithAbort(delayMs);
     }
 
     if (heartbeatResult.status === "ran") {
@@ -369,6 +372,7 @@ async function executeDetachedCronJob(
       delivered?: boolean;
       deliveryAttempted?: boolean;
       deliveryError?: string;
+      deliverySuppressionReason?: NormalizeReplySkipReason;
       delivery?: CronDeliveryTrace;
       nextCheck?: CronNextCheckProposal;
     }
@@ -464,6 +468,7 @@ async function executeDetachedCronJob(
     // successful run so the service can persist it as `lastDeliveryError` and
     // emit it on the finished event for CLI/UI/API run logs (#95419).
     deliveryError: res.deliveryError,
+    deliverySuppressionReason: res.deliverySuppressionReason,
     nextCheck: res.nextCheck,
     summary: res.summary,
     delivered: res.delivered,

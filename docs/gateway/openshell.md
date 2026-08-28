@@ -126,8 +126,10 @@ canonical**:
 
 - Before `exec`, OpenClaw syncs the local workspace into the sandbox.
 - After `exec`, OpenClaw syncs the remote workspace back to local.
-- Concurrent operations sharing the same workspace wait for the current
-  upload, command, and download to finish before starting their own sync.
+- Within one OpenClaw Gateway process, commands and file-tool operations sharing
+  a workspace wait for the current operation to finish. The lock covers the
+  complete upload, command, and download, or the complete file read/mutation and
+  its synchronization; separate backend handles share the same lock.
 - File tools go through the sandbox bridge, but local stays source of truth
   between turns.
 
@@ -135,6 +137,10 @@ Best for development workflows: local edits outside OpenClaw show up on the
 next exec, and the sandbox behaves close to the Docker backend.
 
 Tradeoff: upload + download cost on every exec turn.
+
+External editors and other Gateway processes do not participate in that lock.
+Avoid changing the host workspace while a mirrored command is running, because
+its download can replace those external edits.
 
 ### remote
 
@@ -402,6 +408,12 @@ cannot redirect file access outside the mirrored tree.
 Workspace synchronization excludes `.git`, `hooks`, and `git-hooks` in both
 directions. Repository credentials, history, and trusted hook code remain on
 the OpenClaw Gateway host instead of being copied into an untrusted sandbox.
+
+Mirror synchronization never copies symlinks into either workspace. Existing
+host symlinks remain intact at every depth, along with their parent directories,
+even if the sandbox deletes those directories or replaces them with files.
+Remote replacements that conflict with these preserved host paths are ignored;
+ordinary files and directories still receive remote changes and deletions.
 
 ## Custom image contract
 

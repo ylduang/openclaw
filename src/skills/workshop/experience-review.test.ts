@@ -374,6 +374,38 @@ describe("skill experience review scheduler", () => {
     scheduler.clear();
   });
 
+  it("does not re-arm evidence during asynchronous review preparation", async () => {
+    vi.useFakeTimers();
+    let finishPreparation: (() => void) | undefined;
+    const prepareReview = vi.fn(async (candidate) => {
+      await new Promise<void>((resolve) => {
+        finishPreparation = resolve;
+      });
+      return candidate;
+    });
+    const runReview = vi.fn().mockResolvedValue(undefined);
+    const scheduler = createSkillExperienceReviewScheduler({
+      isSystemActive: () => false,
+      prepareReview,
+      runReview,
+    });
+
+    scheduler.schedule(completedRun({ runId: "deep-turn" }));
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(prepareReview).toHaveBeenCalledOnce();
+    expect(runReview).not.toHaveBeenCalled();
+
+    scheduler.schedule(completedRun({ runId: "shallow-turn", modelIterations: 1 }));
+    finishPreparation?.();
+    await flushMicrotasks();
+    expect(runReview).toHaveBeenCalledOnce();
+
+    await vi.advanceTimersByTimeAsync(60_000);
+
+    expect(runReview).toHaveBeenCalledOnce();
+    scheduler.clear();
+  });
+
   it("serializes reviews across sessions", async () => {
     vi.useFakeTimers();
     let finishFirst: (() => void) | undefined;
@@ -470,8 +502,10 @@ describe("skill experience review prompt", () => {
       ],
     });
     expect(prompt).toContain("this message starts a review pass");
-    expect(prompt).toContain("NOTHING_TO_LEARN is the correct answer for most turns");
-    expect(prompt).toContain("One call at most, smallest mutation first");
+    expect(prompt).toContain("NO_REPLY is the correct answer for most turns");
+    expect(prompt).toContain("One mutation at most, smallest mutation first");
+    expect(prompt).toContain("prepare_patch with one non-empty unique old_string, then patch");
+    expect(prompt).toContain("Reading and preparing do not spend the mutation");
     expect(prompt).toContain("Writable skills:");
     expect(prompt).toContain("- release-runbook — Ship releases");
     expect(prompt).toContain("- local-notes — Local workflow (user-authored)");

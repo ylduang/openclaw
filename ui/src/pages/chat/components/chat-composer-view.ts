@@ -1,9 +1,8 @@
 import { truncateUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
-import { html, nothing, svg, type TemplateResult } from "lit";
+import { html, nothing, type TemplateResult } from "lit";
 import { ifDefined } from "lit/directives/if-defined.js";
 import { ref } from "lit/directives/ref.js";
 import type { GatewaySessionRow } from "../../../api/types.ts";
-import { strokeIcon } from "../../../components/icons-tools.ts";
 import { icons } from "../../../components/icons.ts";
 import { renderSessionProgressCard } from "../../../components/session-progress-card.ts";
 import { t } from "../../../i18n/index.ts";
@@ -87,16 +86,6 @@ type ChatComposerViewContext = {
   slashMenuListboxId: string;
   slashMenuAnnouncementId: string;
 };
-
-const globeOffIcon = strokeIcon(svg` <path
-    d="M10.114 4.462A14.5 14.5 0 0 1 12 2a10 10 0 0 1 9.313 13.643"
-  />
-  <path d="M15.557 15.556A14.5 14.5 0 0 1 12 22 10 10 0 0 1 4.929 4.929" />
-  <path d="M15.892 10.234A14.5 14.5 0 0 0 12 2a10 10 0 0 0-3.643.687" />
-  <path d="M17.656 12H22" />
-  <path d="M19.071 19.071A10 10 0 0 1 12 22 14.5 14.5 0 0 1 8.44 8.45" />
-  <path d="M2 12h10" />
-  <path d="m2 2 20 20" />`);
 
 export function renderChatComposerView(context: ChatComposerViewContext) {
   const {
@@ -222,7 +211,7 @@ export function renderChatComposerView(context: ChatComposerViewContext) {
     : state.dictationError
       ? { text: state.dictationError, tone: "danger" as const, icon: icons.alertTriangle }
       : offlineText
-        ? { text: offlineText, tone: "warn" as const, icon: globeOffIcon }
+        ? { text: offlineText, tone: "warn" as const, icon: icons.globeOff }
         : null;
   const composerUnderlaps =
     showComposerInput && primaryComposerStatus
@@ -242,15 +231,14 @@ export function renderChatComposerView(context: ChatComposerViewContext) {
       : nothing;
   // Dictation previews at the captured selection. The textarea remains
   // read-only until stop commits the same insertion into the real draft.
-  const dictationPreviewDraft =
-    dictation?.active && dictation.partial
-      ? insertComposerDictation(
-          visibleDraft,
-          dictation.partial,
-          state.dictationSelection?.start ?? visibleDraft.length,
-          state.dictationSelection?.end ?? visibleDraft.length,
-        ).value
-      : visibleDraft;
+  const dictationPreviewDraft = dictation?.active
+    ? insertComposerDictation(
+        state.dictationSelection?.value ?? visibleDraft,
+        dictation.transcript,
+        state.dictationSelection?.start ?? visibleDraft.length,
+        state.dictationSelection?.end ?? visibleDraft.length,
+      ).value
+    : visibleDraft;
   const draftDirection = detectTextDirection(dictationPreviewDraft);
   const interruptedStatus = props.runError
     ? nothing
@@ -259,7 +247,15 @@ export function renderChatComposerView(context: ChatComposerViewContext) {
   const compactionStatus = renderCompactionIndicator(props.compactionStatus);
   const progressCard = props.progressCard
     ? html`<div class="agent-chat__progress-float">
-        ${renderSessionProgressCard(props.progressCard, "composer", props.onDismissProgressCard)}
+        ${renderSessionProgressCard(
+          props.progressCard,
+          "composer",
+          props.onDismissProgressCard,
+          activeSession?.status,
+          activeSession?.startedAt,
+          activeSession?.endedAt,
+          props.progressCardHasActiveRun,
+        )}
       </div>`
     : nothing;
   const queue = renderChatQueue({
@@ -293,8 +289,13 @@ export function renderChatComposerView(context: ChatComposerViewContext) {
         })}
       </div>`
     : nothing;
+  const compoundQuestionComposer = Boolean(questionPanelProps && showComposerInput);
   return html`
-    <div class="agent-chat__composer-shell">
+    <div
+      class="agent-chat__composer-shell ${compoundQuestionComposer
+        ? "agent-chat__composer-shell--question-composer"
+        : ""}"
+    >
       <div class="agent-chat__composer-overlay">
         ${props.anchoredNotices ?? nothing} ${composerAlerts} ${fallbackStatus} ${compactionStatus}
         ${interruptedStatus === nothing
@@ -313,7 +314,7 @@ export function renderChatComposerView(context: ChatComposerViewContext) {
       ${disabledBanner} ${progressCard} ${queue} ${goalCard}
       ${showComposerInput
         ? html`<div
-            class="agent-chat__input agent-chat__input--chat ${props.offline
+            class="agent-chat__input agent-chat__input--chat agent-chat__input--mobile-toolbar ${props.offline
               ? "agent-chat__input--offline"
               : ""}${dictation?.active ? " agent-chat__input--dictating" : ""}"
             @wa-show=${handleChatComposerDropdownShow}

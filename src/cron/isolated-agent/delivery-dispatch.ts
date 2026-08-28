@@ -258,15 +258,15 @@ export async function dispatchCronDelivery(
           job: params.job,
           runStartedAt: params.runStartedAt,
         });
-        await logCronDeliveryWarn(
-          `[cron:${params.job.id}] skipping stale delivery scheduled at ${new Date(scheduledAtMs).toISOString()}, started ${Math.round(startDelayMs / 60_000)}m late, current age ${Math.round((nowMs - scheduledAtMs) / 60_000)}m`,
-        );
+        deliveryError = `skipping stale delivery scheduled at ${new Date(scheduledAtMs).toISOString()}, started ${Math.round(startDelayMs / 60_000)}m late, current age ${Math.round((nowMs - scheduledAtMs) / 60_000)}m`;
+        await logCronDeliveryWarn(`[cron:${params.job.id}] ${deliveryError}`);
         return params.withRunSession({
           status: "ok",
           summary,
           outputText,
           deliveryAttempted,
           delivered: false,
+          deliveryError,
           ...params.telemetry,
         });
       }
@@ -338,6 +338,7 @@ export async function dispatchCronDelivery(
         directCronRouteCommitted = true;
         await commitDirectCronOutboundRoute({
           cfg: params.cfgWithAgentDefaults,
+          runSessionKey: params.runSessionKey,
           delivery,
           route: directCronOutboundRoute,
         });
@@ -577,6 +578,9 @@ export async function dispatchCronDelivery(
       }
       return null;
     } catch (err) {
+      await logCronDeliveryError(
+        `[cron:${params.job.id}] delivery failed (${params.deliveryBestEffort ? "bestEffort" : "required"}): ${formatErrorMessage(err)}`,
+      );
       if (!params.deliveryBestEffort) {
         return params.withRunSession({
           status: "error",
@@ -587,9 +591,6 @@ export async function dispatchCronDelivery(
           ...params.telemetry,
         });
       }
-      await logCronDeliveryError(
-        `[cron:${params.job.id}] delivery failed (bestEffort): ${formatErrorMessage(err)}`,
-      );
       deliveryError = formatErrorMessage(err);
       return null;
     }
