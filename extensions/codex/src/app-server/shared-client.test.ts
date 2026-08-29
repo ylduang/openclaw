@@ -119,6 +119,7 @@ vi.mock("openclaw/plugin-sdk/agent-runtime", () => ({
 import {
   assertCodexAppServerClientStartSelectionCurrent,
   captureExclusiveSharedCodexAppServerClient,
+  captureSharedCodexAppServerCatalogLifetime,
   getSharedCodexAppServerClient,
   readCodexAppServerClientDesktopGeneration,
   readCodexAppServerClientProcessIdentity,
@@ -590,38 +591,52 @@ describe("shared Codex app-server client", () => {
     expect(harness.stdinDestroyed).toBe(true);
   });
 
-  it("does not consume a co-lease when selection replacement acquisition fails", async () => {
-    const harness = createClientHarness();
-    vi.spyOn(CodexAppServerClient, "start").mockReturnValue(harness.client);
-    const options = { timeoutMs: 1_000 };
-    const firstLease = getLeasedSharedCodexAppServerClient(options);
-    await sendInitializeResult(harness, "openclaw/0.149.0 (Linux; test)");
-    const client = await firstLease;
-    await expect(getLeasedSharedCodexAppServerClient(options)).resolves.toBe(client);
-    const ownedLease = { client };
-    mocks.resolveManagedCodexAppServerStartOptions.mockRejectedValueOnce(
-      new Error("replacement acquisition failed"),
-    );
+  it.each(["fails", "succeeds"])(
+    "preserves a co-lease when selection replacement acquisition %s",
+    async (replacementOutcome) => {
+      const harness = createClientHarness();
+      const replacement = createClientHarness();
+      const start = vi.spyOn(CodexAppServerClient, "start").mockReturnValue(harness.client);
+      const options = { timeoutMs: 1_000 };
+      const firstLease = getLeasedSharedCodexAppServerClient(options);
+      await sendInitializeResult(harness, "openclaw/0.149.0 (Linux; test)");
+      const client = await firstLease;
+      await expect(getLeasedSharedCodexAppServerClient(options)).resolves.toBe(client);
+      const ownedLease = { client };
+      if (replacementOutcome === "fails") {
+        mocks.resolveManagedCodexAppServerStartOptions.mockRejectedValueOnce(
+          new Error("replacement acquisition failed"),
+        );
+      } else {
+        start.mockReturnValue(replacement.client);
+      }
 
-    await expect(
-      withLeasedCodexAppServerClientStartSelectionRetry({
+      const retry = withLeasedCodexAppServerClientStartSelectionRetry({
         lease: ownedLease,
         options,
-        run: async () => {
+        run: async (attemptClient) => {
+          if (attemptClient !== client) {
+            return attemptClient;
+          }
           throw Object.assign(new Error("selection changed"), {
             code: "CODEX_APP_SERVER_START_SELECTION_CHANGED",
           });
         },
-        onClientChange: () => undefined,
-      }),
-    ).rejects.toThrow("replacement acquisition failed");
-
-    expect(ownedLease.client).toBeUndefined();
-    expect(releaseCodexAppServerClientLease(ownedLease)).toBe(false);
-    expect(harness.stdinDestroyed).toBe(false);
-    expect(releaseLeasedSharedCodexAppServerClient(client)).toBe(true);
-    await vi.waitFor(() => expect(harness.stdinDestroyed).toBe(true));
-  });
+      });
+      if (replacementOutcome === "fails") {
+        await expect(retry).rejects.toThrow("replacement acquisition failed");
+        expect(ownedLease.client).toBeUndefined();
+      } else {
+        await sendInitializeResult(replacement, "openclaw/0.149.0 (Linux; test)");
+        await expect(retry).resolves.toBe(replacement.client);
+        expect(ownedLease.client).toBe(replacement.client);
+      }
+      expect(releaseCodexAppServerClientLease(ownedLease)).toBe(replacementOutcome === "succeeds");
+      expect(harness.stdinDestroyed).toBe(false);
+      expect(releaseLeasedSharedCodexAppServerClient(client)).toBe(true);
+      await vi.waitFor(() => expect(harness.stdinDestroyed).toBe(true));
+    },
+  );
 
   it("falls back before starting a desktop candidate with incomplete Computer Use artifacts", async () => {
     const pluginLocal = createClientHarness();
@@ -2396,6 +2411,14 @@ describe("shared Codex app-server client", () => {
     const lease = getLeasedSharedCodexAppServerClient({ timeoutMs: 1000 });
     await sendInitializeResult(first, "openclaw/0.149.0 (macOS; test)");
     await expect(lease).resolves.toBe(first.client);
+    const current = captureSharedCodexAppServerCatalogLifetime(first.client);
+    expect(current()).toBe(true);
+    expect(releaseLeasedSharedCodexAppServerClient(first.client)).toBe(true);
+    expect(current()).toBe(true);
+    await expect(getLeasedSharedCodexAppServerClient({ timeoutMs: 1000 })).resolves.toBe(
+      first.client,
+    );
+    expect(current()).toBe(true);
 
     // Routine cleanup (e.g. one-shot bundle-MCP) must not yank a healthy
     // client from co-leased sessions; only suspect retirement does.
@@ -2404,10 +2427,32 @@ describe("shared Codex app-server client", () => {
       closed: false,
     });
     expect(first.process.stdin.destroyed).toBe(false);
+    expect(current()).toBe(false);
 
     expect(releaseLeasedSharedCodexAppServerClient(first.client)).toBe(true);
     expect(first.process.stdin.destroyed).toBe(true);
   });
+
+  it.each(["account/login/start", "account/logout", "config/value/write", "config/batchWrite"])(
+    "invalidates catalog observations before %s settles",
+    async (method) => {
+      const transport = createClientHarness();
+      vi.spyOn(CodexAppServerClient, "start").mockReturnValueOnce(transport.client);
+      const lease = getLeasedSharedCodexAppServerClient({ timeoutMs: 1000 });
+      await sendInitializeResult(transport, "openclaw/0.149.0 (test)");
+      const client = await lease;
+      const current = captureSharedCodexAppServerCatalogLifetime(client);
+      expect(current()).toBe(true);
+      const requestIndex = transport.writes.length;
+      const pending = client.request(method, {});
+      const request = JSON.parse(await transport.waitForWrite(requestIndex));
+      expect(current()).toBe(false);
+      transport.send({ id: request.id, result: {} });
+      await pending;
+      expect(current()).toBe(false);
+      releaseLeasedSharedCodexAppServerClient(client);
+    },
+  );
 
   it("waits for a dirty desktop generation before reusing a warm managed client", async () => {
     const generation = { epoch: 1, fingerprint: "desktop-x" };

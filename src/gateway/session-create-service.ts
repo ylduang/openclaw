@@ -126,6 +126,7 @@ export function resolveSessionCreateModelSelection(
   // remains the sole live-catalog availability validator.
   const resolved = resolveSessionPatchModelSelection({
     cfg,
+    agentId,
     catalog: [],
     raw: model,
     defaultProvider: defaults.provider,
@@ -191,6 +192,7 @@ async function existingModelSelectionWouldChange(params: {
   const catalog = await params.loadGatewayModelCatalog();
   const resolved = resolveSessionPatchModelSelection({
     cfg: params.cfg,
+    agentId: params.agentId,
     catalog,
     raw: requestedModel,
     defaultProvider: params.defaultProvider,
@@ -209,6 +211,7 @@ async function existingModelSelectionWouldChange(params: {
   if (!normalizeOptionalString(params.existingEntry.modelOverride) && params.subagentModelHint) {
     const resolvedSubagentDefault = resolveSessionPatchModelSelection({
       cfg: params.cfg,
+      agentId: params.agentId,
       catalog,
       raw: params.subagentModelHint,
       defaultProvider: params.defaultProvider,
@@ -299,6 +302,7 @@ export async function createGatewaySession(params: {
   /** Registry identity recorded only when this request creates a logical session node. */
   projectId?: string;
   pendingProjectGitUrl?: string;
+  pendingWorktree?: InternalSessionEntry["pendingWorktree"];
   incognito?: boolean;
   visibility?: SessionVisibility;
   /** Trusted catalog-owned model/runtime pair, persisted and locked together. */
@@ -980,12 +984,12 @@ export async function createGatewaySession(params: {
             ),
           };
         }
-        if (pendingProjectGitUrl && existingEntry !== undefined) {
+        if ((pendingProjectGitUrl || params.pendingWorktree) && existingEntry !== undefined) {
           return {
             ok: false,
             error: errorShape(
               ErrorCodes.INVALID_REQUEST,
-              "remote project preparation requires a new session",
+              "workspace preparation requires a new session",
             ),
           };
         }
@@ -1162,6 +1166,9 @@ export async function createGatewaySession(params: {
           ...(params.visibility && createdNewEntry ? { visibility: params.visibility } : {}),
           ...(projectId && createdNewEntry ? { projectId } : {}),
           ...(pendingProjectGitUrl && createdNewEntry ? { pendingProjectGitUrl } : {}),
+          ...(params.pendingWorktree && createdNewEntry
+            ? { pendingWorktree: params.pendingWorktree }
+            : {}),
           ...(catalogResolvedModel && catalogAgentRuntime
             ? {
                 providerOverride: catalogResolvedModel.provider,

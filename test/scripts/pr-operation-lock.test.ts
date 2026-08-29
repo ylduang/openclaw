@@ -222,11 +222,19 @@ function installPrCliFixture(repoDir: string) {
     "scripts/pr-lib/changelog.sh",
     "scripts/pr-lib/gates.sh",
     "scripts/pr-lib/ci-dispatch.mjs",
+    "scripts/pr-lib/crabbox-gate-contract.mjs",
+    "scripts/pr-lib/crabbox-gate-plan.mts",
+    "scripts/pr-lib/crabbox-merge-bypass.mjs",
+    "scripts/pr-lib/crabbox-merge-bypass.sh",
     "scripts/pr-lib/push.sh",
     "scripts/pr-lib/review.sh",
     "scripts/pr-lib/review-artifacts.mjs",
     "scripts/pr-lib/prepare-core.sh",
     "scripts/pr-lib/merge.sh",
+    "scripts/pr-lib/merge-outcome.sh",
+    "scripts/crabbox-untrusted-bootstrap.sh",
+    "scripts/pr-crabbox-gate-publisher.mjs",
+    ".github/workflows/pr-crabbox-gate-publisher.yml",
   ];
   for (const file of files) {
     const target = join(repoDir, file);
@@ -1254,9 +1262,9 @@ describePosix("scripts/pr per-PR operation lock", () => {
         mergeScript,
         `${readFileSync(mergeScript, "utf8")}\n` +
           "validate_review_artifact_data() { :; }\n" +
-          "merge_verify() { mark_pr_operation_side_effects_started; }\n",
+          "merge_verify() { MERGE_USE_CRABBOX_ADMIN_BYPASS=false; mark_pr_operation_side_effects_started; }\n",
       );
-      git("add", "scripts");
+      git("add", "scripts", ".github");
       git("commit", "-qm", "test: native cleanup fixture");
       const preparedHead = git("rev-parse", "HEAD");
       git("update-ref", "refs/remotes/origin/main", preparedHead);
@@ -1286,23 +1294,23 @@ describePosix("scripts/pr per-PR operation lock", () => {
         "set -euo pipefail",
         'case "$*" in',
         '  "auth token") exit 1 ;;',
+        '  "api graphql --hostname "*)',
+        '    state=OPEN; if grep -q "^merged$" "$OPENCLAW_TEST_LIFECYCLE"; then state=MERGED; fi',
+        `    jq -cn --arg state "$state" --arg head '${preparedHead}' '{data:{repository:{id:"fixture-repo",url:"https://github.com/fixture/repo",nameWithOwner:"fixture/repo",ref:{target:{oid:$head}},pullRequest:{id:"fixture-pr",number:42,url:"https://github.com/fixture/repo/pull/42",state:$state,headRefOid:$head,baseRefName:"main",isDraft:false,mergeCommit:(if $state=="MERGED" then {oid:$head} else null end),autoMergeRequest:null,isInMergeQueue:false,isMergeQueueEnabled:false,mergeable:"MERGEABLE",mergeStateStatus:"CLEAN"}}}}' ;;`,
         '  "api graphql "*) printf "fixture-user\\n" ;;',
-        '  "pr view 42 --json baseRefName")',
-        '    printf "invocation\\t%s\\n" "$PWD" >> "$OPENCLAW_TEST_LIFECYCLE"',
-        `    printf '%s\\n' '{"baseRefName":"main"}' ;;`,
-        `  "pr view 42 --json state,isDraft") printf '%s\\n' '{"state":"OPEN","isDraft":false}' ;;`,
         '  "pr merge 42 "*)',
         '    git rev-parse refs/openclaw/pr-operation-locks/42 > "$OPENCLAW_TEST_OWNER"',
         '    if [ "$OPENCLAW_TEST_FAILURE" = merge ]; then echo "fixture merge failed" >&2; exit 7; fi',
         '    printf "merged\\n" >> "$OPENCLAW_TEST_LIFECYCLE" ;;',
         '  "pr view 42 --json state --jq .state") printf "MERGED\\n" ;;',
-        `  "pr view 42 --json mergeCommit "*) printf '%s\\n' '${preparedHead}' ;;`,
+        '  "repo view --json id,nameWithOwner,url")',
+        '    printf "invocation\\t%s\\n" "$PWD" >> "$OPENCLAW_TEST_LIFECYCLE"',
+        `    printf '%s\\n' '{"id":"fixture-repo","url":"https://github.com/fixture/repo","nameWithOwner":"fixture/repo"}' ;;`,
         '  "repo view "*) printf "fixture/repo\\n" ;;',
-        '  "api --method POST repos/{owner}/{repo}/issues/42/comments "*)',
+        '  "api --hostname github.com --method POST repos/fixture/repo/issues/42/comments "*)',
         '    printf "comment\\n" >> "$OPENCLAW_TEST_LIFECYCLE"',
         '    printf "https://example.invalid/comment\\n" ;;',
-        `  "pr view 42 --json headRefName,"*) printf '%s\\n' '{"headRefName":""}' ;;`,
-        '  "pr view 42 --json url --jq .url") printf "https://example.invalid/42\\n" ;;',
+        `  "pr view 42 --repo "*) printf '%s\\n' '{"headRefName":""}' ;;`,
         '  *) echo "unexpected fixture gh call: $*" >&2; exit 99 ;;',
         "esac",
       ]);
@@ -1339,7 +1347,7 @@ describePosix("scripts/pr per-PR operation lock", () => {
             ...process.env,
             OPENCLAW_GH_BIN: gh,
             OPENCLAW_PR_AUTO_MERGE: "0",
-            OPENCLAW_PR_MERGE_METHOD: "squash",
+            OPENCLAW_PR_MERGE_METHOD: "merge",
             OPENCLAW_TEST_FAILURE: failure,
             OPENCLAW_TEST_LIFECYCLE: lifecycle,
             OPENCLAW_TEST_OWNER: ownerFile,
@@ -1367,7 +1375,7 @@ describePosix("scripts/pr per-PR operation lock", () => {
         expect(readFileSync(releaseCwd, "utf8").trim(), output).toBe(repoDir);
         expect(result.status, output).toBe(failure === "none" ? 0 : 1);
         expect(result.stdout).toContain(
-          command === "gc" ? "removed .worktrees/pr-42" : "merge-run complete for PR #42",
+          command === "gc" ? "removed .worktrees/pr-42" : "Merge confirmed; completion pending",
         );
       }
       if (failure === "none") {
