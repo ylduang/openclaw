@@ -7557,6 +7557,8 @@ public struct ProvisioningSessionPlacement: Codable, Sendable {
     public let createdatms: Int
     public let updatedatms: Int
     public let statechangedatms: Int
+    public let providerid: String?
+    public let profileid: String?
     public let environmentid: String?
 
     public init(
@@ -7565,6 +7567,8 @@ public struct ProvisioningSessionPlacement: Codable, Sendable {
         createdatms: Int,
         updatedatms: Int,
         statechangedatms: Int,
+        providerid: String? = nil,
+        profileid: String? = nil,
         environmentid: String? = nil)
     {
         self.state = state
@@ -7572,6 +7576,8 @@ public struct ProvisioningSessionPlacement: Codable, Sendable {
         self.createdatms = createdatms
         self.updatedatms = updatedatms
         self.statechangedatms = statechangedatms
+        self.providerid = providerid
+        self.profileid = profileid
         self.environmentid = environmentid
     }
 
@@ -7581,6 +7587,8 @@ public struct ProvisioningSessionPlacement: Codable, Sendable {
         case createdatms = "createdAtMs"
         case updatedatms = "updatedAtMs"
         case statechangedatms = "stateChangedAtMs"
+        case providerid = "providerId"
+        case profileid = "profileId"
         case environmentid = "environmentId"
     }
 }
@@ -7591,6 +7599,8 @@ public struct SyncingSessionPlacement: Codable, Sendable {
     public let createdatms: Int
     public let updatedatms: Int
     public let statechangedatms: Int
+    public let providerid: String?
+    public let profileid: String?
     public let environmentid: String
     public let workerbundlehash: String
 
@@ -7600,6 +7610,8 @@ public struct SyncingSessionPlacement: Codable, Sendable {
         createdatms: Int,
         updatedatms: Int,
         statechangedatms: Int,
+        providerid: String? = nil,
+        profileid: String? = nil,
         environmentid: String,
         workerbundlehash: String)
     {
@@ -7608,6 +7620,8 @@ public struct SyncingSessionPlacement: Codable, Sendable {
         self.createdatms = createdatms
         self.updatedatms = updatedatms
         self.statechangedatms = statechangedatms
+        self.providerid = providerid
+        self.profileid = profileid
         self.environmentid = environmentid
         self.workerbundlehash = workerbundlehash
     }
@@ -7618,6 +7632,8 @@ public struct SyncingSessionPlacement: Codable, Sendable {
         case createdatms = "createdAtMs"
         case updatedatms = "updatedAtMs"
         case statechangedatms = "stateChangedAtMs"
+        case providerid = "providerId"
+        case profileid = "profileId"
         case environmentid = "environmentId"
         case workerbundlehash = "workerBundleHash"
     }
@@ -7629,6 +7645,8 @@ public struct StartingSessionPlacement: Codable, Sendable {
     public let createdatms: Int
     public let updatedatms: Int
     public let statechangedatms: Int
+    public let providerid: String?
+    public let profileid: String?
     public let environmentid: String
     public let workerbundlehash: String
     public let workspacebasemanifestref: String
@@ -7640,6 +7658,8 @@ public struct StartingSessionPlacement: Codable, Sendable {
         createdatms: Int,
         updatedatms: Int,
         statechangedatms: Int,
+        providerid: String? = nil,
+        profileid: String? = nil,
         environmentid: String,
         workerbundlehash: String,
         workspacebasemanifestref: String,
@@ -7650,6 +7670,8 @@ public struct StartingSessionPlacement: Codable, Sendable {
         self.createdatms = createdatms
         self.updatedatms = updatedatms
         self.statechangedatms = statechangedatms
+        self.providerid = providerid
+        self.profileid = profileid
         self.environmentid = environmentid
         self.workerbundlehash = workerbundlehash
         self.workspacebasemanifestref = workspacebasemanifestref
@@ -7662,6 +7684,8 @@ public struct StartingSessionPlacement: Codable, Sendable {
         case createdatms = "createdAtMs"
         case updatedatms = "updatedAtMs"
         case statechangedatms = "stateChangedAtMs"
+        case providerid = "providerId"
+        case profileid = "profileId"
         case environmentid = "environmentId"
         case workerbundlehash = "workerBundleHash"
         case workspacebasemanifestref = "workspaceBaseManifestRef"
@@ -7675,6 +7699,8 @@ public struct ActiveWorkerSessionPlacement: Codable, Sendable {
     public let createdatms: Int
     public let updatedatms: Int
     public let statechangedatms: Int
+    public let providerid: String?
+    public let profileid: String?
     public let environmentid: String
     public let activeownerepoch: Int
     public let workerbundlehash: String
@@ -7692,6 +7718,8 @@ public struct ActiveWorkerSessionPlacement: Codable, Sendable {
         createdatms: Int,
         updatedatms: Int,
         statechangedatms: Int,
+        providerid: String? = nil,
+        profileid: String? = nil,
         environmentid: String,
         activeownerepoch: Int,
         workerbundlehash: String,
@@ -7708,6 +7736,8 @@ public struct ActiveWorkerSessionPlacement: Codable, Sendable {
         self.createdatms = createdatms
         self.updatedatms = updatedatms
         self.statechangedatms = statechangedatms
+        self.providerid = providerid
+        self.profileid = profileid
         self.environmentid = environmentid
         self.activeownerepoch = activeownerepoch
         self.workerbundlehash = workerbundlehash
@@ -7726,6 +7756,8 @@ public struct ActiveWorkerSessionPlacement: Codable, Sendable {
         case createdatms = "createdAtMs"
         case updatedatms = "updatedAtMs"
         case statechangedatms = "stateChangedAtMs"
+        case providerid = "providerId"
+        case profileid = "profileId"
         case environmentid = "environmentId"
         case activeownerepoch = "activeOwnerEpoch"
         case workerbundlehash = "workerBundleHash"
@@ -7745,6 +7777,8 @@ public struct DrainingSessionPlacement: Codable, Sendable {
     public let createdatms: Int
     public let updatedatms: Int
     public let statechangedatms: Int
+    public let providerid: String?
+    public let profileid: String?
     public let environmentid: String
     public let activeownerepoch: Int
     public let workerbundlehash: String
@@ -7761,6 +7795,8 @@ public struct DrainingSessionPlacement: Codable, Sendable {
         createdatms: Int,
         updatedatms: Int,
         statechangedatms: Int,
+        providerid: String? = nil,
+        profileid: String? = nil,
         environmentid: String,
         activeownerepoch: Int,
         workerbundlehash: String,
@@ -7776,6 +7812,8 @@ public struct DrainingSessionPlacement: Codable, Sendable {
         self.createdatms = createdatms
         self.updatedatms = updatedatms
         self.statechangedatms = statechangedatms
+        self.providerid = providerid
+        self.profileid = profileid
         self.environmentid = environmentid
         self.activeownerepoch = activeownerepoch
         self.workerbundlehash = workerbundlehash
@@ -7793,6 +7831,8 @@ public struct DrainingSessionPlacement: Codable, Sendable {
         case createdatms = "createdAtMs"
         case updatedatms = "updatedAtMs"
         case statechangedatms = "stateChangedAtMs"
+        case providerid = "providerId"
+        case profileid = "profileId"
         case environmentid = "environmentId"
         case activeownerepoch = "activeOwnerEpoch"
         case workerbundlehash = "workerBundleHash"
@@ -7811,6 +7851,8 @@ public struct ReconcilingSessionPlacement: Codable, Sendable {
     public let createdatms: Int
     public let updatedatms: Int
     public let statechangedatms: Int
+    public let providerid: String?
+    public let profileid: String?
     public let environmentid: String
     public let activeownerepoch: Int
     public let workerbundlehash: String
@@ -7827,6 +7869,8 @@ public struct ReconcilingSessionPlacement: Codable, Sendable {
         createdatms: Int,
         updatedatms: Int,
         statechangedatms: Int,
+        providerid: String? = nil,
+        profileid: String? = nil,
         environmentid: String,
         activeownerepoch: Int,
         workerbundlehash: String,
@@ -7842,6 +7886,8 @@ public struct ReconcilingSessionPlacement: Codable, Sendable {
         self.createdatms = createdatms
         self.updatedatms = updatedatms
         self.statechangedatms = statechangedatms
+        self.providerid = providerid
+        self.profileid = profileid
         self.environmentid = environmentid
         self.activeownerepoch = activeownerepoch
         self.workerbundlehash = workerbundlehash
@@ -7859,6 +7905,8 @@ public struct ReconcilingSessionPlacement: Codable, Sendable {
         case createdatms = "createdAtMs"
         case updatedatms = "updatedAtMs"
         case statechangedatms = "stateChangedAtMs"
+        case providerid = "providerId"
+        case profileid = "profileId"
         case environmentid = "environmentId"
         case activeownerepoch = "activeOwnerEpoch"
         case workerbundlehash = "workerBundleHash"
@@ -7877,6 +7925,8 @@ public struct ReclaimedSessionPlacement: Codable, Sendable {
     public let createdatms: Int
     public let updatedatms: Int
     public let statechangedatms: Int
+    public let providerid: String?
+    public let profileid: String?
     public let environmentid: String?
     public let activeownerepoch: Int?
     public let workspacebasemanifestref: String?
@@ -7894,6 +7944,8 @@ public struct ReclaimedSessionPlacement: Codable, Sendable {
         createdatms: Int,
         updatedatms: Int,
         statechangedatms: Int,
+        providerid: String? = nil,
+        profileid: String? = nil,
         environmentid: String? = nil,
         activeownerepoch: Int? = nil,
         workspacebasemanifestref: String? = nil,
@@ -7910,6 +7962,8 @@ public struct ReclaimedSessionPlacement: Codable, Sendable {
         self.createdatms = createdatms
         self.updatedatms = updatedatms
         self.statechangedatms = statechangedatms
+        self.providerid = providerid
+        self.profileid = profileid
         self.environmentid = environmentid
         self.activeownerepoch = activeownerepoch
         self.workspacebasemanifestref = workspacebasemanifestref
@@ -7928,6 +7982,8 @@ public struct ReclaimedSessionPlacement: Codable, Sendable {
         case createdatms = "createdAtMs"
         case updatedatms = "updatedAtMs"
         case statechangedatms = "stateChangedAtMs"
+        case providerid = "providerId"
+        case profileid = "profileId"
         case environmentid = "environmentId"
         case activeownerepoch = "activeOwnerEpoch"
         case workspacebasemanifestref = "workspaceBaseManifestRef"
@@ -7947,6 +8003,8 @@ public struct FailedSessionPlacement: Codable, Sendable {
     public let createdatms: Int
     public let updatedatms: Int
     public let statechangedatms: Int
+    public let providerid: String?
+    public let profileid: String?
     public let environmentid: String?
     public let activeownerepoch: Int?
     public let workspacebasemanifestref: String?
@@ -7965,6 +8023,8 @@ public struct FailedSessionPlacement: Codable, Sendable {
         createdatms: Int,
         updatedatms: Int,
         statechangedatms: Int,
+        providerid: String? = nil,
+        profileid: String? = nil,
         environmentid: String? = nil,
         activeownerepoch: Int? = nil,
         workspacebasemanifestref: String? = nil,
@@ -7982,6 +8042,8 @@ public struct FailedSessionPlacement: Codable, Sendable {
         self.createdatms = createdatms
         self.updatedatms = updatedatms
         self.statechangedatms = statechangedatms
+        self.providerid = providerid
+        self.profileid = profileid
         self.environmentid = environmentid
         self.activeownerepoch = activeownerepoch
         self.workspacebasemanifestref = workspacebasemanifestref
@@ -8001,6 +8063,8 @@ public struct FailedSessionPlacement: Codable, Sendable {
         case createdatms = "createdAtMs"
         case updatedatms = "updatedAtMs"
         case statechangedatms = "stateChangedAtMs"
+        case providerid = "providerId"
+        case profileid = "profileId"
         case environmentid = "environmentId"
         case activeownerepoch = "activeOwnerEpoch"
         case workspacebasemanifestref = "workspaceBaseManifestRef"
@@ -9343,6 +9407,7 @@ public struct SessionsCreateParams: Codable, Sendable {
     public let model: String?
     public let contextwindow: String?
     public let thinkinglevel: String?
+    public let fastmode: AnyCodable?
     public let permissionmode: SessionPermissionMode?
     public let tooloverrides: [String: AnyCodable]?
     public let incognito: Bool?
@@ -9374,6 +9439,7 @@ public struct SessionsCreateParams: Codable, Sendable {
         model: String? = nil,
         contextwindow: String? = nil,
         thinkinglevel: String? = nil,
+        fastmode: AnyCodable? = nil,
         permissionmode: SessionPermissionMode? = nil,
         tooloverrides: [String: AnyCodable]? = nil,
         incognito: Bool? = nil,
@@ -9404,6 +9470,7 @@ public struct SessionsCreateParams: Codable, Sendable {
         self.model = model
         self.contextwindow = contextwindow
         self.thinkinglevel = thinkinglevel
+        self.fastmode = fastmode
         self.permissionmode = permissionmode
         self.tooloverrides = tooloverrides
         self.incognito = incognito
@@ -9436,6 +9503,7 @@ public struct SessionsCreateParams: Codable, Sendable {
         case model
         case contextwindow = "contextWindow"
         case thinkinglevel = "thinkingLevel"
+        case fastmode = "fastMode"
         case permissionmode = "permissionMode"
         case tooloverrides = "toolOverrides"
         case incognito
@@ -14711,6 +14779,7 @@ public struct ModelChoice: Codable, Sendable {
     public let reasoning: Bool?
     public let thinkinglevels: [[String: AnyCodable]]?
     public let thinkingdefault: String?
+    public let effectivefastmode: AnyCodable?
     public let supportstools: Bool?
     public let agentruntime: [String: AnyCodable]?
     public let apikeysupported: Bool?
@@ -14731,6 +14800,7 @@ public struct ModelChoice: Codable, Sendable {
         reasoning: Bool? = nil,
         thinkinglevels: [[String: AnyCodable]]? = nil,
         thinkingdefault: String? = nil,
+        effectivefastmode: AnyCodable? = nil,
         supportstools: Bool? = nil,
         agentruntime: [String: AnyCodable]? = nil,
         apikeysupported: Bool? = nil,
@@ -14750,6 +14820,7 @@ public struct ModelChoice: Codable, Sendable {
         self.reasoning = reasoning
         self.thinkinglevels = thinkinglevels
         self.thinkingdefault = thinkingdefault
+        self.effectivefastmode = effectivefastmode
         self.supportstools = supportstools
         self.agentruntime = agentruntime
         self.apikeysupported = apikeysupported
@@ -14771,6 +14842,7 @@ public struct ModelChoice: Codable, Sendable {
         case reasoning
         case thinkinglevels = "thinkingLevels"
         case thinkingdefault = "thinkingDefault"
+        case effectivefastmode = "effectiveFastMode"
         case supportstools = "supportsTools"
         case agentruntime = "agentRuntime"
         case apikeysupported = "apiKeySupported"
@@ -18062,6 +18134,7 @@ public struct PendingApprovalSnapshot: Codable, Sendable {
     public let expiresatms: Int
     public let presentation: ApprovalPresentation
     public let status: String
+    public let sourcesessionkey: String?
 
     public init(
         id: String,
@@ -18069,7 +18142,8 @@ public struct PendingApprovalSnapshot: Codable, Sendable {
         createdatms: Int,
         expiresatms: Int,
         presentation: ApprovalPresentation,
-        status: String)
+        status: String,
+        sourcesessionkey: String? = nil)
     {
         self.id = id
         self.urlpath = urlpath
@@ -18077,6 +18151,7 @@ public struct PendingApprovalSnapshot: Codable, Sendable {
         self.expiresatms = expiresatms
         self.presentation = presentation
         self.status = status
+        self.sourcesessionkey = sourcesessionkey
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -18086,6 +18161,7 @@ public struct PendingApprovalSnapshot: Codable, Sendable {
         case expiresatms = "expiresAtMs"
         case presentation
         case status
+        case sourcesessionkey = "sourceSessionKey"
     }
 }
 
@@ -20767,15 +20843,19 @@ public struct ChatHistoryResetResult: Codable, Sendable {
 
 public struct ChatMetadataParams: Codable, Sendable {
     public let agentid: String?
+    public let sessionkey: String?
 
     public init(
-        agentid: String? = nil)
+        agentid: String? = nil,
+        sessionkey: String? = nil)
     {
         self.agentid = agentid
+        self.sessionkey = sessionkey
     }
 
     private enum CodingKeys: String, CodingKey {
         case agentid = "agentId"
+        case sessionkey = "sessionKey"
     }
 }
 
