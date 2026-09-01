@@ -61,7 +61,7 @@ import {
   normalizeChatSendShortcut,
 } from "./settings.ts";
 import { renderCollapsedAssistantToggles } from "./shell-assistant-toggles.ts";
-import { createUpdateProgressWatcher } from "./update-overlay-helpers.ts";
+import { createUpdateProgressWatcher } from "./update-confirmation.ts";
 
 const EMPTY_SESSION_HAS_DRAFT = () => false;
 
@@ -639,10 +639,9 @@ export function renderApplicationShell(host: ShellViewHost) {
         .custodianAvailable=${custodianPanelAvailable}
         .homeAvailable=${homePanelAvailable}
         .custodianSuppressed=${activeRoute === "custodian"}
-        .sessionPage=${activeRoute === "chat"}
         .pageSessionKey=${host.activeSessionKey}
         .pageAgentId=${selectedAgentId}
-        .workPage=${activeRoute}
+        .pageRouteId=${activeRoute}
         .minimizeRequestId=${host.custodianMinimizeRequestId}
       ></openclaw-assistant-panel>
       ${isOptionalElementDefined(host.execApprovalElement)
