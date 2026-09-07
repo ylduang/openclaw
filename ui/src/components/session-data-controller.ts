@@ -10,6 +10,7 @@ import {
 import type { ApplicationContext } from "../app/context.ts";
 import { readPresenceEntries, type PresencePayload } from "../app/user-profile.ts";
 import { formatUiError } from "../lib/format-error.ts";
+import { isGatewayAvailable } from "../lib/gateway-availability.ts";
 import {
   CATALOG_SESSION_CONTINUED_EVENT,
   type CatalogSessionContinuedDetail,
@@ -23,8 +24,9 @@ import {
   evictArchivedSessionLineage,
   fetchChildSessionRows,
   fetchSessionLineage,
-  preserveActiveSessionLineageRows,
+  mergeRefreshedChildSessionRows,
   publishActiveSessionLineage,
+  retireStaleChildSessionRows,
 } from "./app-sidebar-child-session-data.ts";
 import { SessionCatalogLiveState } from "./app-sidebar-session-catalog-live.ts";
 import { bindAdoptedCatalogSession } from "./app-sidebar-session-catalogs.ts";
@@ -42,7 +44,7 @@ import {
   scheduleSessionCatalogRefresh,
   type SessionCatalogDataOwner,
   type SessionDataControllerHost,
-  updateSessionCatalogData as updateSessionCatalogDataForHost,
+  updateSessionCatalogData,
 } from "./session-data-controller-catalog.ts";
 import {
   hasSidebarListFilter,
@@ -100,13 +102,14 @@ export class SessionDataController implements ReactiveController, SessionCatalog
   private gatewayConnectionRevision = 0;
   private gatewayClient: GatewayBrowserClient | null = null;
   private gatewayConnected = false;
+  private gatewayAvailable = false;
   // Bind mutation completions to one epoch so stale failures cannot cross reconnects.
   private sessionMutationEpoch = 0;
   // Owns the abort signal handed to every epoch-scoped destructive confirm dialog.
   // Retiring the epoch aborts it so a dialog open across a reconnect dismisses
   // itself instead of confirming into a mutation scope that no longer applies.
   private sessionMutationAbortController = new AbortController();
-  private readonly scroll = new SessionDataScrollController(() => this.notify());
+  private readonly scroll = new SessionDataScrollController(() => this.requestSessionDataUpdate());
   private approvalBadgeQueue: ApplicationContext<RouteId>["overlays"]["snapshot"]["approvalQueue"] =
     [];
   private approvalBadges: ApprovalBadgeSnapshot = deriveApprovalBadgeSnapshot([]);
@@ -169,17 +172,11 @@ export class SessionDataController implements ReactiveController, SessionCatalog
     return this.host.connected;
   }
 
-  expandedAgentId(): string {
-    return this.host.expandedAgentId();
-  }
+  expandedAgentId = (): string => this.host.expandedAgentId();
 
-  requestSessionDataUpdate(): void {
-    this.host.requestUpdate();
-  }
+  readonly requestSessionDataUpdate = () => this.host.requestUpdate();
 
   sessionListQuery = (agentId: string) => sidebarSessionListQuery(this.host, agentId);
-
-  private readonly notify = () => this.requestSessionDataUpdate();
 
   hostConnected(): void {
     this.subscriptions.hostConnected();
@@ -191,9 +188,13 @@ export class SessionDataController implements ReactiveController, SessionCatalog
   }
 
   hostUpdated(): void {
-    this.synchronizeSessionScope();
-    this.scroll.synchronize(this.host);
-    this.updateSessionCatalogData(true);
+    // Lit can finish a queued update after disconnect. Keep retired timers and
+    // observers closed until the host reconnects.
+    if (this.host.isConnected) {
+      this.synchronizeSessionScope();
+      this.scroll.synchronize(this.host);
+      updateSessionCatalogData(this, true);
+    }
   }
 
   hostDisconnected(): void {
@@ -204,6 +205,7 @@ export class SessionDataController implements ReactiveController, SessionCatalog
     this.gatewaySource = null;
     this.gatewayClient = null;
     this.gatewayConnected = false;
+    this.gatewayAvailable = false;
     this.retireSessionCatalogData();
     this.scroll.dispose();
     this.clearActiveSessionLineageRetry();
@@ -257,7 +259,7 @@ export class SessionDataController implements ReactiveController, SessionCatalog
     this.sessionCatalogRefreshStatus = createPanelRefreshStatus();
     this.sessionCatalogPageDepths.clear();
     this.sessionCatalogRevisions.clear();
-    this.notify();
+    this.requestSessionDataUpdate();
   }
 
   synchronizeSessionScope(): void {
@@ -304,7 +306,7 @@ export class SessionDataController implements ReactiveController, SessionCatalog
       this.clearSessionCache();
     }
     this.bindFilteredSessions(nextAgentId ?? "");
-    this.notify();
+    this.requestSessionDataUpdate();
 
     if (
       agentChanged &&
@@ -313,10 +315,6 @@ export class SessionDataController implements ReactiveController, SessionCatalog
     ) {
       void this.refreshSidebarSessions();
     }
-  }
-
-  updateSessionCatalogData(defer = false): void {
-    updateSessionCatalogDataForHost(this, defer);
   }
 
   handleSessionCatalogHostEvent(payload: unknown): void {
@@ -340,7 +338,7 @@ export class SessionDataController implements ReactiveController, SessionCatalog
       return;
     }
     this.sessionCatalogs = bindAdoptedCatalogSession(this.sessionCatalogs, detail);
-    this.notify();
+    this.requestSessionDataUpdate();
     // Invalidate in-flight polls and load-more merges so a pre-adoption
     // snapshot cannot clobber the patched rows; the 30s poll reconfirms.
     this.sessionCatalogRevision += 1;
@@ -379,15 +377,10 @@ export class SessionDataController implements ReactiveController, SessionCatalog
 
   private resetChildSessionState(preserveOperatorContext = false): void {
     this.childSessionGeneration += 1;
-    this.childSessionRowsByParent = preserveOperatorContext
-      ? preserveActiveSessionLineageRows(
-          this.activeSessionLineageRouteKey,
-          this.childSessionRowsByParent,
-        )
-      : {};
     this.loadedChildSessionKeys = new Set();
     this.loadingChildSessionKeys = new Set();
     if (!preserveOperatorContext) {
+      this.childSessionRowsByParent = {};
       this.childSessionErrorsByParent = new Map();
       this.activeSessionLineageRoot = null;
       this.activeSessionLineageSelectedRow = null;
@@ -416,10 +409,10 @@ export class SessionDataController implements ReactiveController, SessionCatalog
           ? preserveRosterPresentationMetadata(canonical, previous)
           : (previous ?? null);
       }
-      // Canonical root changes invalidate successful child snapshots, not operator-owned failures.
-      // Expanded parents refetch only when no failure blocks them.
+      // Navigation retains snapshots for expanded or selected parents that revalidate and
+      // retires collapsed snapshots until reopened. Generation fencing and operator errors persist.
       this.resetChildSessionState(true);
-      this.notify();
+      this.requestSessionDataUpdate();
     }
     const snapshot = sessions.state;
     if (hasSidebarListFilter(this.host)) {
@@ -444,7 +437,7 @@ export class SessionDataController implements ReactiveController, SessionCatalog
       publishSidebarSessionList(this, snapshot);
     }
     this.sessionsLoading = snapshot.loading;
-    this.notify();
+    this.requestSessionDataUpdate();
   };
 
   private synchronizeSessions(sessions: SessionCapability): void {
@@ -472,12 +465,19 @@ export class SessionDataController implements ReactiveController, SessionCatalog
       gateway !== this.gatewaySource ||
       gateway.connectionRevision !== this.gatewayConnectionRevision;
     const clientChanged = client !== this.gatewayClient;
-    const connectedStarted = connected && !this.gatewayConnected;
     const sourceOrClientChanged = sessionSourceChanged || clientChanged;
     const connectionChanged = connected !== this.gatewayConnected;
+    const available = isGatewayAvailable(gateway.snapshot);
+    const becameAvailable = available && !this.gatewayAvailable;
+    this.gatewayAvailable = available;
     // Presence and auth snapshots must not retire this client's in-flight
     // native or catalog pages unless its connection phase actually changes.
     if (!sourceOrClientChanged && !connectionChanged) {
+      const { awaitingGateway, error } = this.sessionCatalogRefreshStatus;
+      const requesting = this.sessionCatalogLive.requestGeneration !== null;
+      if (becameAvailable && (awaitingGateway || error !== null || requesting)) {
+        scheduleSessionCatalogRefresh(this, true);
+      }
       return;
     }
     this.invalidateSessionMutations();
@@ -488,23 +488,20 @@ export class SessionDataController implements ReactiveController, SessionCatalog
     this.presenceInstanceId = client?.instanceId;
     if (!connected) {
       this.presencePayload = undefined;
-    } else if (clientChanged || connectedStarted) {
+    } else if (clientChanged || connectionChanged) {
       const presence = readPresenceEntries(gateway.snapshot.hello?.snapshot);
       this.presencePayload = presence ? { presence } : undefined;
     }
-    this.notify();
-    if (!sourceOrClientChanged) {
-      this.retireSessionCatalogData();
-      if (connected && this.sessionsSource && hasSidebarListFilter(this.host)) {
-        void this.refreshSidebarSessions();
+    this.requestSessionDataUpdate();
+    if (sourceOrClientChanged) {
+      // Session rows belong to the logical Gateway, not one replaceable socket client.
+      if (sessionSourceChanged) {
+        this.clearSessionCache();
       }
-      return;
+      this.resetSessionCatalogConnection();
+    } else {
+      this.retireSessionCatalogData();
     }
-    // Session rows belong to the logical Gateway, not one replaceable socket client.
-    if (sessionSourceChanged) {
-      this.clearSessionCache();
-    }
-    this.resetSessionCatalogConnection();
     if (connected && this.sessionsSource && hasSidebarListFilter(this.host)) {
       void this.refreshSidebarSessions();
     }
@@ -518,7 +515,7 @@ export class SessionDataController implements ReactiveController, SessionCatalog
     this.sessionResultsByAgent = {};
     this.resetChildSessionState();
     this.visibleSessionLimits.clear();
-    this.notify();
+    this.requestSessionDataUpdate();
   }
 
   private retireFilteredSessions(): void {
@@ -562,6 +559,10 @@ export class SessionDataController implements ReactiveController, SessionCatalog
     return refreshSidebarSessionList(this, this.sessionsAgentId, true);
   }
 
+  retireStaleChildSessions(revalidating: ReadonlySet<string>): void {
+    retireStaleChildSessionRows(this, this.activeSessionLineageRouteKey, revalidating);
+  }
+
   async loadChildSessions(parentKey: string): Promise<void> {
     if (
       !parentKey ||
@@ -577,7 +578,7 @@ export class SessionDataController implements ReactiveController, SessionCatalog
     }
     const generation = this.childSessionGeneration;
     this.loadingChildSessionKeys = new Set([...this.loadingChildSessionKeys, parentKey]);
-    this.notify();
+    this.requestSessionDataUpdate();
     try {
       const isCurrent = () =>
         generation === this.childSessionGeneration && sessions === this.context?.sessions;
@@ -585,12 +586,14 @@ export class SessionDataController implements ReactiveController, SessionCatalog
       if (!rows || !isCurrent()) {
         return;
       }
-      for (const existing of this.childSessionRowsByParent[parentKey] ?? []) {
-        if (!rows.some((row) => row.key === existing.key)) {
-          rows.push(existing);
-        }
-      }
-      this.childSessionRowsByParent = { ...this.childSessionRowsByParent, [parentKey]: rows };
+      // Server rows replace the snapshot, so removed children disappear; only the
+      // routed lineage survives omission because the selected pane still needs it.
+      this.childSessionRowsByParent = mergeRefreshedChildSessionRows(
+        this.activeSessionLineageRouteKey,
+        this.childSessionRowsByParent,
+        parentKey,
+        rows,
+      );
       this.loadedChildSessionKeys = new Set([...this.loadedChildSessionKeys, parentKey]);
     } catch (error) {
       if (generation !== this.childSessionGeneration || sessions !== this.context?.sessions) {
@@ -605,13 +608,13 @@ export class SessionDataController implements ReactiveController, SessionCatalog
         parentKey,
         formatUiError(error),
       );
-      this.notify();
+      this.requestSessionDataUpdate();
     } finally {
       if (generation === this.childSessionGeneration && sessions === this.context?.sessions) {
         const next = new Set(this.loadingChildSessionKeys);
         next.delete(parentKey);
         this.loadingChildSessionKeys = next;
-        this.notify();
+        this.requestSessionDataUpdate();
       }
     }
   }
@@ -629,7 +632,7 @@ export class SessionDataController implements ReactiveController, SessionCatalog
       this.activeSessionLineageRoot = null;
       this.activeSessionLineageSelectedRow = null;
       this.clearActiveSessionLineageRetry();
-      this.notify();
+      this.requestSessionDataUpdate();
     }
     const { gateway, sessions } = this.context ?? {};
     const client = gateway?.snapshot.client;
@@ -666,13 +669,13 @@ export class SessionDataController implements ReactiveController, SessionCatalog
       return;
     }
     publishActiveSessionLineage(this, normalizedKey, lineage, request.sourceRevision);
-    this.notify();
+    this.requestSessionDataUpdate();
     this.activeSessionLineageRequest = null;
     if (lineage.lookupFailed) {
       this.activeSessionLineageRetryTimer = globalThis.setTimeout(() => {
         this.activeSessionLineageRetryTimer = null;
         if (this.activeSessionLineageRouteKey === normalizedKey) {
-          this.notify();
+          this.requestSessionDataUpdate();
         }
       }, 5_000);
       return;
@@ -682,12 +685,12 @@ export class SessionDataController implements ReactiveController, SessionCatalog
 
   setVisibleSessionLimit(sectionId: string, limit: number): void {
     this.visibleSessionLimits.set(sectionId, limit);
-    this.notify();
+    this.requestSessionDataUpdate();
   }
 
   dismissSessionMutationError(): void {
     publishSidebarSessionError(this, null, "action");
-    this.notify();
+    this.requestSessionDataUpdate();
   }
 
   resetSessionList(): void {
@@ -704,7 +707,7 @@ export class SessionDataController implements ReactiveController, SessionCatalog
     } else if (this.context) {
       this.bindFilteredSessions(this.host.expandedAgentId());
     }
-    this.notify();
+    this.requestSessionDataUpdate();
   }
 
   discardEmptyChildSessionSnapshot(sessionKey: string): void {
@@ -715,7 +718,7 @@ export class SessionDataController implements ReactiveController, SessionCatalog
       const loadedKeys = new Set(this.loadedChildSessionKeys);
       loadedKeys.delete(sessionKey);
       this.loadedChildSessionKeys = loadedKeys;
-      this.notify();
+      this.requestSessionDataUpdate();
     }
   }
 
@@ -724,7 +727,7 @@ export class SessionDataController implements ReactiveController, SessionCatalog
       const errors = new Map(this.childSessionErrorsByParent);
       errors.delete(sessionKey);
       this.childSessionErrorsByParent = errors;
-      this.notify();
+      this.requestSessionDataUpdate();
     }
     void this.loadChildSessions(sessionKey);
   }
@@ -736,7 +739,7 @@ export class SessionDataController implements ReactiveController, SessionCatalog
     // new one can be issued; otherwise it stays modal until manually closed.
     this.sessionMutationAbortController.abort();
     this.sessionMutationAbortController = new AbortController();
-    this.notify();
+    this.requestSessionDataUpdate();
   }
 
   beginSessionMutation(): SidebarSessionMutationScope | null {
@@ -750,7 +753,7 @@ export class SessionDataController implements ReactiveController, SessionCatalog
       return null;
     }
     publishSidebarSessionError(this, null, "action");
-    this.notify();
+    this.requestSessionDataUpdate();
     return {
       epoch: this.sessionMutationEpoch,
       context,
@@ -779,7 +782,7 @@ export class SessionDataController implements ReactiveController, SessionCatalog
   publishSessionMutationError(scope: SidebarSessionMutationScope, error: unknown): void {
     if (this.isSessionMutationScopeCurrent(scope)) {
       publishSidebarSessionError(this, formatUiError(error), "action");
-      this.notify();
+      this.requestSessionDataUpdate();
     }
   }
 }
