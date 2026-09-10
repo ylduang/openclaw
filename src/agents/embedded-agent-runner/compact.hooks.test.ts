@@ -237,6 +237,7 @@ function mockResolvedModel(params?: {
           | undefined
       )?.models?.providers?.[provider];
       return {
+        logicalRef: { provider, model: modelId },
         model: {
           provider,
           api: providerConfig?.api ?? "openai-responses",
@@ -1844,12 +1845,13 @@ describe("compactEmbeddedAgentSessionDirect hooks", () => {
       info: { ownsCompaction: false },
       compact: contextEngineCompactMock,
     });
-    resolveModelMock.mockReturnValueOnce({
+    resolveModelMock.mockImplementationOnce((provider = "openai", modelId = "fake") => ({
+      logicalRef: { provider, model: modelId },
       model: { provider: "openai", api: "openai-responses", id: "fake", input: [] },
       error: null,
       authStorage: { setRuntimeApiKey: vi.fn() },
       modelRegistry: {},
-    });
+    }));
     createOpenClawCodingToolsMock.mockReturnValueOnce([
       {
         name: "healthy_lookup",
@@ -3438,6 +3440,7 @@ describe("compactEmbeddedAgentSession hooks (ownsCompaction engine)", () => {
         const api = providerConfig?.api ?? defaultApi;
         const subscription = api === "openai-chatgpt-responses";
         return {
+          logicalRef: { provider, model: modelId },
           model: {
             provider,
             id: modelId,
@@ -3730,6 +3733,8 @@ describe("compactEmbeddedAgentSession hooks (ownsCompaction engine)", () => {
   });
 
   it("releases the prepared runtime lease when host authority expires after admission", async () => {
+    const { AsyncWorkScope } = await import("../../shared/async-work-scope.js");
+    const parent = new AsyncWorkScope();
     const admissionStarted = createDeferred();
     const releaseAdmission = createDeferred();
     const releaseLease = vi.fn();
@@ -3747,18 +3752,27 @@ describe("compactEmbeddedAgentSession hooks (ownsCompaction engine)", () => {
       return { ...lease, release: releaseLease };
     }) as never);
 
-    const pending = compactEmbeddedAgentSession(wrappedCompactionArgs(), {
-      assertActive: () => {
-        if (!hostActive) {
-          throw new Error("queued compaction host authority expired");
-        }
-      },
-    });
+    const pending = parent.run(() =>
+      compactEmbeddedAgentSession(wrappedCompactionArgs(), {
+        assertActive: () => {
+          if (!hostActive) {
+            throw new Error("queued compaction host authority expired");
+          }
+        },
+      }),
+    );
     await admissionStarted.promise;
     hostActive = false;
     releaseAdmission.resolve(undefined);
 
-    await expect(pending).rejects.toThrow("queued compaction host authority expired");
+    try {
+      await expect(pending).rejects.toThrow("queued compaction host authority expired");
+    } finally {
+      await AsyncWorkScope.runWhenAllIdle(
+        () => [parent],
+        () => parent.drain(),
+      );
+    }
     expect(releaseLease).toHaveBeenCalledTimes(1);
     expect(resolveContextEngineMock).not.toHaveBeenCalled();
   });
@@ -3919,7 +3933,8 @@ describe("compactEmbeddedAgentSession hooks (ownsCompaction engine)", () => {
       dispose,
     } as never);
     resolveModelAsyncMock
-      .mockResolvedValueOnce({
+      .mockImplementationOnce(async (provider, modelId) => ({
+        logicalRef: { provider, model: modelId },
         model: {
           provider: "openai",
           id: "fake",
@@ -3930,7 +3945,7 @@ describe("compactEmbeddedAgentSession hooks (ownsCompaction engine)", () => {
         error: null,
         authStorage,
         modelRegistry: {},
-      })
+      }))
       .mockRejectedValueOnce(new Error("route materialization failed"));
 
     await expect(
@@ -3968,10 +3983,11 @@ describe("compactEmbeddedAgentSession hooks (ownsCompaction engine)", () => {
     const releaseModelResolution = createDeferred();
     const authStorage = { setRuntimeApiKey: vi.fn() };
     let hostActive = true;
-    resolveModelAsyncMock.mockImplementationOnce(async () => {
+    resolveModelAsyncMock.mockImplementationOnce(async (provider, modelId) => {
       modelResolutionStarted.resolve(undefined);
       await releaseModelResolution.promise;
       return {
+        logicalRef: { provider, model: modelId },
         model: {
           provider: "openai",
           id: "fake",
