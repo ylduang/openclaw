@@ -34,6 +34,11 @@ import {
   requireWorktreeDiskSpace,
   WORKTREE_SETUP_HEADROOM_BYTES,
 } from "./capacity.js";
+import {
+  addManagedWorktree,
+  collectWorktreeTemplates,
+  WORKTREE_TEMPLATE_DIRECTORY,
+} from "./checkout.js";
 import { lockState, lockWorktreeForProcess, unlockWorktree } from "./git-lock.js";
 import {
   commandError,
@@ -44,7 +49,6 @@ import {
   requireGitBuffer,
   resolveGitRepositoryPaths,
   runGit,
-  WORKTREE_CHECKOUT_TIMEOUT_MS,
   type GitResult,
 } from "./git.js";
 import { worktreeOwnerMatches } from "./owner.js";
@@ -75,6 +79,7 @@ import {
   finalizeWorktreeRemoval,
   hasLiveWorktreeRunLease,
 } from "./run-lease.js";
+import { listTemplates } from "./template-registry.js";
 import type {
   CreateManagedWorktreeParams,
   ManagedWorktreeBranch,
@@ -211,7 +216,7 @@ function startRemovalTiming() {
 type ServiceOptions = {
   env?: NodeJS.ProcessEnv;
   now?: () => number;
-  getConfig?: () => Pick<OpenClawConfig, "worktreeRoot">;
+  getConfig?: () => Pick<OpenClawConfig, "worktreeRoot" | "worktreeAcceleration">;
 };
 
 export type WorktreeCleanupLimits = {
@@ -327,10 +332,10 @@ type ResolvedRepository = {
   fingerprint: string;
 };
 
-async function resolveRepositoryFromRealPath(
+async function resolveCheckoutRootFromRealPath(
   requested: string,
   requestedLabel: string,
-): Promise<ResolvedRepository> {
+): Promise<string> {
   const rootResult = await runGit(requested, ["rev-parse", "--show-toplevel"]);
   if (rootResult.code !== 0) {
     if (insideGitCheckout(requested)) {
@@ -347,6 +352,14 @@ async function resolveRepositoryFromRealPath(
       `git checkout has no commits: ${requestedLabel}. Create an initial commit, then retry.`,
     );
   }
+  return sourceRoot;
+}
+
+async function resolveRepositoryFromRealPath(
+  requested: string,
+  requestedLabel: string,
+): Promise<ResolvedRepository> {
+  const sourceRoot = await resolveCheckoutRootFromRealPath(requested, requestedLabel);
   const { canonicalRoot, commonDir } = await resolveGitRepositoryPaths(sourceRoot);
   const origin = await runGit(canonicalRoot, ["config", "--get", "remote.origin.url"]);
   const originUrl = origin.code === 0 ? origin.stdout.trim() : "";
@@ -1100,11 +1113,21 @@ export class ManagedWorktreeService {
     params.commitGuard?.();
     let gitBase = base.gitOperand;
     let recordBase = base.recordRef;
-    const worktreeAddArgs = () => ["worktree", "add", "-b", branch, "--", worktreePath, gitBase];
-    let added = await runGit(repository.repoRoot, worktreeAddArgs(), {
-      timeoutMs: WORKTREE_CHECKOUT_TIMEOUT_MS,
-      signal: params.signal,
-    });
+    const addCheckout = () =>
+      addManagedWorktree({
+        env: this.env,
+        now: this.now,
+        enabled: this.getConfig?.().worktreeAcceleration !== false,
+        repoRoot: repository.repoRoot,
+        commonDir: repository.commonDir,
+        worktreeRoot: path.dirname(root),
+        destination: worktreePath,
+        branch,
+        base: gitBase,
+        signal: params.signal,
+        commitGuard: () => params.commitGuard?.(),
+      });
+    let added = await addCheckout();
     if (added.code !== 0 && base.remote) {
       if (!(await canResetFailedWorktreeAdd(repository.repoRoot, worktreePath, branch, added))) {
         throw commandError("git worktree add", added);
@@ -1114,10 +1137,7 @@ export class ManagedWorktreeService {
       params.commitGuard?.();
       gitBase = "HEAD";
       recordBase = "HEAD";
-      added = await runGit(repository.repoRoot, worktreeAddArgs(), {
-        timeoutMs: WORKTREE_CHECKOUT_TIMEOUT_MS,
-        signal: params.signal,
-      });
+      added = await addCheckout();
     }
     if (added.code !== 0) {
       throw commandError("git worktree add", added);
@@ -1227,22 +1247,27 @@ export class ManagedWorktreeService {
     repoRoot: string,
     options: { includeRepositoryStatus?: boolean } = {},
   ): Promise<ManagedWorktreeBranchesResult> {
-    let repository: ResolvedRepository;
-    if (options.includeRepositoryStatus) {
-      try {
-        const requested = await fs.realpath(repoRoot);
+    let sourceRoot: string;
+    try {
+      const requested = await fs.realpath(repoRoot).catch(() => {
+        throw new Error(`repository does not exist: ${repoRoot}`);
+      });
+      if (options.includeRepositoryStatus) {
         if (!(await fs.stat(requested)).isDirectory()) {
           return { branches: [], repositoryStatus: "unavailable" };
         }
         if (!insideGitCheckout(requested)) {
           return { branches: [], repositoryStatus: "not_git" };
         }
-        repository = await resolveRepositoryFromRealPath(requested, repoRoot);
-      } catch {
+      }
+      // Ref discovery needs this checkout's HEAD, not allocation identity or a
+      // full inventory of sibling worktrees rooted at the primary checkout.
+      sourceRoot = await resolveCheckoutRootFromRealPath(requested, repoRoot);
+    } catch (error) {
+      if (options.includeRepositoryStatus) {
         return { branches: [], repositoryStatus: "unavailable" };
       }
-    } else {
-      repository = await resolveRepository(repoRoot);
+      throw error;
     }
     // Keep canonical refs for identity and Git's strict short names for selection.
     // A branch named like a tag may need heads/ or remotes/ to remain unambiguous.
@@ -1251,7 +1276,7 @@ export class ManagedWorktreeService {
     for (const prefix of ["refs/remotes/", "refs/heads/"]) {
       try {
         for (const entry of await listRepositoryBranchRefs(
-          repository.repoRoot,
+          sourceRoot,
           prefix,
           BRANCH_SUGGESTIONS_PER_KIND,
         )) {
@@ -1263,13 +1288,13 @@ export class ManagedWorktreeService {
         branchesUnavailable = true;
       }
     }
-    const remoteHead = await runGit(repository.repoRoot, [
+    const remoteHead = await runGit(sourceRoot, [
       "symbolic-ref",
       "--quiet",
       "refs/remotes/origin/HEAD",
     ]);
     const defaultRef = remoteHead.code === 0 ? remoteHead.stdout.trim() : undefined;
-    const head = await runGit(repository.repoRoot, ["symbolic-ref", "--quiet", "HEAD"]);
+    const head = await runGit(sourceRoot, ["symbolic-ref", "--quiet", "HEAD"]);
     const headRef = head.code === 0 ? head.stdout.trim() : undefined;
     const resolveBranch = async (ref: string | undefined) => {
       if (!ref) {
@@ -1281,7 +1306,7 @@ export class ManagedWorktreeService {
       }
       try {
         // Patterns can match descendants; only the exact priority ref is eligible.
-        return (await listRepositoryBranchRefs(repository.repoRoot, ref, 1)).find(
+        return (await listRepositoryBranchRefs(sourceRoot, ref, 1)).find(
           (entry) => entry.ref === ref,
         );
       } catch {
@@ -1507,11 +1532,21 @@ export class ManagedWorktreeService {
     params.commitGuard?.();
     await fs.mkdir(path.dirname(record.path), { recursive: true });
     params.commitGuard?.();
-    await requireGit(
-      record.repoRoot,
-      ["worktree", "add", "--detach", record.path, record.snapshotRef],
-      { timeoutMs: WORKTREE_CHECKOUT_TIMEOUT_MS, signal: params.signal },
-    );
+    const added = await addManagedWorktree({
+      env: this.env,
+      now: this.now,
+      enabled: this.getConfig?.().worktreeAcceleration !== false,
+      repoRoot: record.repoRoot,
+      commonDir: repository.commonDir,
+      worktreeRoot: path.dirname(path.dirname(record.path)),
+      destination: record.path,
+      base: record.snapshotRef,
+      signal: params.signal,
+      commitGuard: () => params.commitGuard?.(),
+    });
+    if (added.code !== 0) {
+      throw commandError("git worktree add", added);
+    }
     let branchCreated = false;
     let restoredProvisionedPaths: string[];
     try {
@@ -1715,6 +1750,20 @@ export class ManagedWorktreeService {
       } catch (error) {
         log.warn(`idle cleanup failed for ${record.id}: ${String(error)}`);
       }
+    }
+    try {
+      // Empty caches must not wait behind checkout creation. Collection rereads
+      // the templates under the lease before retiring any artifacts.
+      if (listTemplates(this.env).length > 0) {
+        await this.withAllocationLease({}, async (guard) => {
+          await collectWorktreeTemplates(this.env, now - IDLE_GC_MS, {
+            signal: guard.signal,
+            commitGuard: () => guard.commitGuard?.(),
+          });
+        });
+      }
+    } catch (error) {
+      log.warn(`worktree template cleanup deferred: ${String(error)}`);
     }
     removed = removed.concat(await this.enforceCleanupLimits(params));
     const orphansDeleted = await this.reconcileOrphans(records);
@@ -1953,7 +2002,7 @@ export class ManagedWorktreeService {
     }
     let deleted = 0;
     for (const fingerprint of fingerprints) {
-      if (!fingerprint.isDirectory()) {
+      if (!fingerprint.isDirectory() || fingerprint.name === WORKTREE_TEMPLATE_DIRECTORY) {
         continue;
       }
       const fingerprintPath = path.join(worktreesRoot, fingerprint.name);

@@ -1,16 +1,141 @@
+import fsSync from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
+import { resolvePathViaExistingAncestorSync } from "./boundary-path.js";
+import { sha256HexPrefixCore } from "./crypto-digest.js";
 import {
   acquireGatewayLifecycleCoordinator,
   acquireStateDatabaseCoordinator,
+  acquireStateDatabaseHandleExclusion,
+  resolveStateDatabaseCoordinatorPath,
   withStateSchemaFence,
 } from "./state-database-coordinator.js";
 
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 
 describe("state database coordinator", () => {
+  it.each([
+    [false, false],
+    [false, true],
+    [true, false],
+    [true, true],
+  ])(
+    "bounds component path probes with explicit coordinator %s and existing database %s",
+    (explicit, existing) => {
+      const root = tempDirs.make("openclaw-state-coordinator-path-work-");
+      const params = {
+        databasePath: path.join(root, "state", "openclaw.sqlite"),
+        runtimeDirectory: root,
+        uid: typeof process.getuid === "function" ? process.getuid() : undefined,
+        coordinatorPath: explicit ? path.join(root, "custom", "coordinator.sqlite") : undefined,
+      };
+      const resolvePath = vi.spyOn(fsSync, "realpathSync");
+      try {
+        for (let attempt = 0; attempt < 2; attempt++) {
+          params.databasePath = path.join(root, `state-${attempt}`, "openclaw.sqlite");
+          if (existing) {
+            fsSync.mkdirSync(path.dirname(params.databasePath));
+            fsSync.writeFileSync(params.databasePath, "");
+          }
+          const expectedPath =
+            params.coordinatorPath ?? resolveStateDatabaseCoordinatorPath(params);
+          resolvePath.mockClear();
+          const coordinator = acquireStateDatabaseCoordinator(params);
+          try {
+            expect(coordinator.path).toBe(expectedPath);
+            expect(resolvePath).toHaveBeenCalledTimes(existing ? 0 : 1);
+          } finally {
+            coordinator.release();
+          }
+        }
+      } finally {
+        resolvePath.mockRestore();
+      }
+    },
+  );
+
+  it.each([false, true])(
+    "preserves the shipped path identity with native failure %s",
+    (failNative) => {
+      const root = tempDirs.make("openclaw-coordinator-identity-");
+      const target = path.join(root, "target");
+      const alias = path.join(root, "alias");
+      fsSync.mkdirSync(target);
+      fsSync.writeFileSync(path.join(target, "state.sqlite"), "");
+      fsSync.symlinkSync(target, alias, process.platform === "win32" ? "junction" : "dir");
+      const paths = [target, alias, path.join(alias, "missing")];
+      if (process.platform === "win32") {
+        paths.push(
+          target.toUpperCase(),
+          target.replace(/^[A-Z]:/, (drive) => drive.toLowerCase()),
+        );
+      }
+      const legacyPaths = paths.map((directory) => {
+        const databasePath = path.join(directory, "state.sqlite");
+        const canonical = resolvePathViaExistingAncestorSync(databasePath);
+        return {
+          databasePath,
+          runtimeDirectory: directory,
+          expected: path.join(
+            resolvePathViaExistingAncestorSync(directory),
+            "openclaw-state-locks-42",
+            `state-lifecycle.${sha256HexPrefixCore(canonical, 8)}.lock.sqlite`,
+          ),
+        };
+      });
+      const native = failNative
+        ? vi.spyOn(fsSync.realpathSync, "native").mockImplementation(() => {
+            throw new Error("native path resolution unavailable");
+          })
+        : undefined;
+      try {
+        for (const { expected, ...params } of legacyPaths) {
+          expect(resolveStateDatabaseCoordinatorPath({ ...params, uid: 42 })).toBe(expected);
+        }
+      } finally {
+        native?.mockRestore();
+      }
+    },
+  );
+
+  it("resolves lifecycle paths after the current write authority callback", () => {
+    const root = tempDirs.make("openclaw-state-coordinator-authority-path-");
+    const params = {
+      databasePath: path.join(root, "state", "openclaw.sqlite"),
+      runtimeDirectory: path.join(root, "initial-runtime"),
+      uid: typeof process.getuid === "function" ? process.getuid() : undefined,
+    };
+    const nextRuntime = path.join(root, "next-runtime");
+    const expectedPath = resolveStateDatabaseCoordinatorPath({
+      ...params,
+      runtimeDirectory: nextRuntime,
+    });
+    const exclusion = acquireStateDatabaseHandleExclusion(params);
+    let changeRuntime = false;
+    try {
+      exclusion.runWithCanonicalWrites(
+        () => {
+          if (changeRuntime) {
+            params.runtimeDirectory = nextRuntime;
+          }
+        },
+        () => {
+          changeRuntime = true;
+          const coordinator = acquireStateDatabaseCoordinator(params);
+          try {
+            expect(coordinator.path).toBe(expectedPath);
+          } finally {
+            coordinator.release();
+          }
+        },
+      );
+    } finally {
+      exclusion.release();
+    }
+  });
+
   it.each([
     ["state", acquireStateDatabaseCoordinator],
     ["Gateway", acquireGatewayLifecycleCoordinator],
