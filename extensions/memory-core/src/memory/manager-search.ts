@@ -1,11 +1,11 @@
 // Memory Core plugin module implements manager search behavior.
 import type { DatabaseSync } from "node:sqlite";
-import { truncateUtf16Safe } from "openclaw/plugin-sdk/memory-core-host-engine-foundation";
 import {
   cosineSimilarity,
   parseEmbedding,
-  type MemorySource,
-} from "openclaw/plugin-sdk/memory-core-host-engine-storage";
+  truncateUtf16Safe,
+} from "openclaw/plugin-sdk/memory-core-host-engine-knn";
+import type { MemorySource } from "openclaw/plugin-sdk/memory-core-host-engine-storage";
 import {
   normalizeStringEntries,
   normalizeStringEntriesLower,
@@ -350,6 +350,7 @@ export async function searchVector(params: {
   signal?: AbortSignal;
   ensureVectorReady: (dimensions: number) => Promise<boolean>;
   runVectorKnn?: (request: VectorKnnRequest, signal?: AbortSignal) => Promise<VectorKnnResponse>;
+  runFallback?: () => Promise<SearchRowResult[]>;
   sourceFilterVec: { sql: string; params: SearchSource[] };
   sourceFilterChunks: { sql: string; params: SearchSource[] };
 }): Promise<SearchRowResult[]> {
@@ -358,17 +359,19 @@ export async function searchVector(params: {
   }
   params.signal?.throwIfAborted();
   const providerModels = resolveProviderModels(params.providerModel, params.providerModelAliases);
-  const searchFallback = () =>
-    searchChunksByEmbedding({
-      db: params.db,
-      providerModel: params.providerModel,
-      providerModelAliases: params.providerModelAliases,
-      sourceFilter: params.sourceFilterChunks,
-      queryVec: params.queryVec,
-      limit: params.limit,
-      snippetMaxChars: params.snippetMaxChars,
-      signal: params.signal,
-    });
+  const searchFallback =
+    params.runFallback ??
+    (() =>
+      searchChunksByEmbedding({
+        db: params.db,
+        providerModel: params.providerModel,
+        providerModelAliases: params.providerModelAliases,
+        sourceFilter: params.sourceFilterChunks,
+        queryVec: params.queryVec,
+        limit: params.limit,
+        snippetMaxChars: params.snippetMaxChars,
+        signal: params.signal,
+      }));
   const vectorReady = await params.ensureVectorReady(params.queryVec.length);
   params.signal?.throwIfAborted();
   if (vectorReady) {
@@ -403,7 +406,22 @@ export async function searchVector(params: {
   return await searchFallback();
 }
 
-async function searchChunksByEmbedding(params: {
+function resolveSnippetProjection(column: "text" | "c.text", snippetMaxChars: number) {
+  const snippetByteLimit =
+    Number.isSafeInteger(snippetMaxChars) && snippetMaxChars > 0 ? snippetMaxChars * 4 : undefined;
+  // Byte prefixes preserve NUL in UTF-8 and UTF-16 databases. Four bytes per
+  // UTF-16 unit leave final truncation to truncateUtf16Safe. SQLite returns
+  // NULL for an empty BLOB substring, so retain the original empty text.
+  return {
+    sql:
+      snippetByteLimit === undefined
+        ? column
+        : `COALESCE(CAST(substr(CAST(${column} AS BLOB), 1, ?) AS TEXT), ${column})`,
+    params: snippetByteLimit === undefined ? [] : [snippetByteLimit],
+  };
+}
+
+export async function searchChunksByEmbedding(params: {
   db: DatabaseSync;
   providerModel: string;
   providerModelAliases?: string[];
@@ -432,8 +450,9 @@ async function searchChunksByEmbedding(params: {
     rowid: number | bigint;
     embedding: string;
   };
+  const snippet = resolveSnippetProjection("text", params.snippetMaxChars);
   const payloadStmt = params.db.prepare(
-    `SELECT id, path, start_line, end_line, text, source FROM memory_index_chunks WHERE rowid = ?`,
+    `SELECT id, path, start_line, end_line, ${snippet.sql} AS text, source FROM memory_index_chunks WHERE rowid = ?`,
   );
   type ChunkPayload = {
     id: string;
@@ -466,7 +485,7 @@ async function searchChunksByEmbedding(params: {
         // Hydrate contenders before yielding so an old score cannot acquire a
         // replacement chunk's payload.
         // SAFETY: these schema-defined columns belong to this rowid in the active read snapshot.
-        const payload = payloadStmt.get(row.rowid) as ChunkPayload;
+        const payload = payloadStmt.get(...snippet.params, row.rowid) as ChunkPayload;
         const result: SearchRowResult = {
           id: payload.id,
           path: payload.path,
@@ -638,6 +657,7 @@ export async function searchPathKeyword(params: {
   if (params.limit <= 0) {
     return [];
   }
+  const snippet = resolveSnippetProjection("c.text", params.snippetMaxChars);
   const pathColumn = `${params.pathFtsTable}.path`;
   const pathPlans = planPathKeywordSearch({
     query: params.query,
@@ -708,7 +728,7 @@ export async function searchPathKeyword(params: {
           `   LIMIT ?\n` +
           `)\n` +
           `SELECT c.id, exact_paths.path, exact_paths.source,\n` +
-          `       c.start_line, c.end_line, c.text, exact_paths.exact_path_specificity\n` +
+          `       c.start_line, c.end_line, ${snippet.sql} AS text, exact_paths.exact_path_specificity\n` +
           `  FROM exact_paths\n` +
           `  JOIN memory_index_chunks c ON c.id = (\n` +
           `    SELECT candidate.id FROM memory_index_chunks candidate\n` +
@@ -720,7 +740,7 @@ export async function searchPathKeyword(params: {
           ` ORDER BY exact_paths.exact_path_specificity DESC,\n` +
           `          exact_paths.path ASC, exact_paths.source ASC`,
       )
-      .all(...candidateParams, exactPathQuery, exactPathLimit) as ExactPathRow[];
+      .all(...candidateParams, exactPathQuery, exactPathLimit, ...snippet.params) as ExactPathRow[];
   };
   const useLexicalExactCandidates =
     isAscii(exactPathQuery) && (plan.matchQuery !== null || plan.substringTerms.length > 0);
@@ -797,7 +817,7 @@ export async function searchPathKeyword(params: {
           `   LIMIT ?\n` +
           `)\n` +
           `SELECT c.id, retained_paths.path, retained_paths.source,\n` +
-          `       c.start_line, c.end_line, c.text, retained_paths.rank\n` +
+          `       c.start_line, c.end_line, ${snippet.sql} AS text, retained_paths.rank\n` +
           `  FROM retained_paths\n` +
           `  JOIN memory_index_chunks c ON c.id = (\n` +
           `    SELECT candidate.id FROM memory_index_chunks candidate\n` +
@@ -808,7 +828,7 @@ export async function searchPathKeyword(params: {
           `  )\n` +
           ` ORDER BY retained_paths.rank ASC, retained_paths.path ASC, retained_paths.source ASC`,
       )
-      .all(...queryParams, exactPathQuery, resultLimit) as PathLexicalRow[];
+      .all(...queryParams, exactPathQuery, resultLimit, ...snippet.params) as PathLexicalRow[];
   };
   const loadLexicalRows = (lexicalPlan: (typeof pathPlans)[number]) => {
     // Partition before LIMIT so an exact-filename flood cannot consume the
