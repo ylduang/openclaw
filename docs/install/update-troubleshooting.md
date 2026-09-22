@@ -146,15 +146,23 @@ probe, or unreadable layout stops the update before staging; an unknown
 destination is never treated as empty. Restore inspection access or make
 `npm prefix -g` succeed with the selected runtime. Ask the deployment owner to
 verify unreadable layouts and explicitly select the intended installation.
-The report names the destination (or says that npm could not resolve it), the cause,
-and the selected service's launcher when available. Switch the runtime back and
+The saved outcome and public failure report name the destination prefix, package,
+launcher, running installation, and classified ownership cause. Public paths
+replace your home with `~` and redact other home-directory usernames. `openclaw
+update status` and Doctor retain the warning and recovery step. A symlinked prefix
+that resolves to the same installation is admitted; spelling alone does not make
+a destination foreign. Switch the runtime back and
 retry through the retained absolute launcher. Alternatively, with the destination
 owner's agreement, explicitly select that installation for the intended service
 using a printed `gateway install --force` command when available, then update. This changes
 the service binding; it is not permission to overwrite another deployment's
 package. A protected service definition uses deployment-owner instructions instead;
 `--force` cannot replace a sealed mount. Dry-run returns the same refusal. Recorded attempts remain in update
-history and are shown by Doctor.
+history and are shown by Doctor. If the active CLI and service point at different
+installations, follow [Gateway service recovery](/cli/doctor/recovery#gateway-service-recovery)
+to select the intended installation while preserving its state and service account.
+An older updater that refuses before staging cannot load a candidate's improved
+diagnostics; resolve its prefix mismatch before retrying the update.
 
 If the ranges do not overlap, install a supported Node and select a compatible
 OpenClaw target; that candidate cannot run through this updater on a supported
@@ -228,6 +236,21 @@ restarting the same 2026.9.4 fleet resolves the failed-update condition.
 
 ## Plugin repair warnings
 
+`post-update-plugins` / `plugin-convergence` with
+`post-plugin-doctor-execution-failed` can describe a Doctor child failure after
+the package was already installed. Updated convergence records that execution
+failure as a warning, retains its exit reason and available plugin diagnostics,
+and continues to config validation, readiness checks, and Gateway activation.
+`openclaw update status` shows the warning even when the update succeeds. A later
+failure report keeps it in a separate **Warnings** section.
+
+A throwing plugin config-repair hook leaves that plugin's input unchanged and
+names the plugin in its warning. Repair the plugin, then run
+`openclaw doctor --fix` or `openclaw update repair`.
+Explicit state-migration or config-write refusals remain blocking. So does a
+Doctor child whose shutdown could not be confirmed: it may still write state.
+Preserve the backup and resolve that specific refusal before retrying.
+
 Doctor's configured-plugin repair and payload-verification warnings do not block
 Gateway readiness. A tracked plugin whose payload is unavailable is marked
 unavailable, and its configuration and pending migration inputs stay preserved.
@@ -272,6 +295,21 @@ cannot be restored; healthy plugins retain their available recovery snapshots.
 Older releases can reject enable, uninstall, and reinstall while trying to copy
 that same missing capture. Restart the Gateway through its service owner before
 retrying, or upgrade the host. See [plugin source lifetime](/plugins/architecture#runtime-instance-and-source-lifetime).
+
+### Large model-catalog temporary directories
+
+Older releases can retain several complete plugin copies inside
+`openclaw-model-catalog-*` directories. A scan of only top-level
+`openclaw-plugin-build-*` paths misses those nested copies. Current catalog
+workers reuse the selected runtime capture for provider discovery and remove
+their scratch tree when its owner retires.
+
+Upgrade the host, then run `openclaw doctor` to inspect legacy captures.
+`openclaw doctor --fix` removes whole legacy catalog trees only during maintenance
+when no other OpenClaw process is running. Do not delete captures based on their
+age or absence from open-file or memory-map lists: an idle owner can still need
+them. Modern captures use SQLite custody to prove retirement. See
+[plugin source lifetime](/plugins/architecture#runtime-instance-and-source-lifetime).
 
 ## Reason codes
 
