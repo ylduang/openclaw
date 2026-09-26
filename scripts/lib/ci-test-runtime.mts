@@ -66,6 +66,7 @@ const nativeCompilerTestFiles = [
   "test/scripts/native-typescript.test.ts",
   "test/scripts/nodes-cli-import-closure.test.ts",
   "test/scripts/ts-topology.test.ts",
+  "test/scripts/typecheck-inert.test.ts",
   "test/test-helper-extension-import-boundary.test.ts",
 ];
 // Bun fork 3ff0efc82217775e04094a1d4402d7c6932ecb24 failed or added skips in these files.
@@ -83,7 +84,6 @@ const runtimePartitions = new Map<
         "packages/markdown-core/src/render-aware-chunking.test.ts",
         // Bun skips a sibling diagnostics subscriber when warm-worker cleanup unsubscribes.
         "src/agents/code-mode-node.test.ts",
-        "src/agents/sandbox/docker.execDockerRaw.enoent.test.ts",
         "src/cli/cli-process-diagnostics.test.ts",
         // Native heap accounting, GC, and Worker limits require V8.
         "src/infra/worker-task-pool.memory.test.ts",
@@ -115,9 +115,9 @@ const runtimePartitions = new Map<
         globSync(controlUiTestGlobs, { cwd, exclude: controlUiE2eTestGlobs })
           .map((file) => file.replaceAll("\\", "/"))
           .toSorted(),
-      // These whole files retain their GC assertions on Node; Bun runs every other UI file.
+      // Bun GC can retain released chat and overview payloads; keep their retention proof on Node.
       nodeRequired: new Set([
-        "ui/src/pages/chat/chat-pane-retained-presentation.test.ts",
+        "ui/src/pages/chat/chat-thread.test.ts",
         "ui/src/pages/usage/usage-page-details.test.ts",
       ]),
       includeAfterShard: true,
