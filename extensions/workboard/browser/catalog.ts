@@ -5,7 +5,7 @@ import { getWorkboardState, invalidateWorkboardLoads } from "./lib/workboard/run
 import { WORKBOARD_CHANGED_EVENT, type WorkboardBoardSummary } from "./lib/workboard/types.ts";
 
 type WorkboardCatalogSnapshot = {
-  boards: readonly Pick<WorkboardBoardSummary, "id" | "name" | "icon" | "color">[];
+  boards: readonly Pick<WorkboardBoardSummary, "id" | "name" | "kind" | "icon" | "color">[];
   ready: boolean;
 };
 
@@ -63,6 +63,16 @@ export class WorkboardCatalog {
     if (event === WORKBOARD_CHANGED_EVENT && this.connected && this.client) {
       this.ensureAndRecover(true);
     }
+  }
+
+  removeBoard(id: string): void {
+    this.generation += 1;
+    this.load = null;
+    invalidateWorkboardLoads(this.host);
+    const state = getWorkboardState(this.host);
+    state.boards = state.boards.filter((board) => board.id !== id);
+    this.publishCatalog(state.boards, this.snapshot.ready);
+    this.ensureAndRecover(true);
   }
 
   dispose(): void {
@@ -168,9 +178,10 @@ export class WorkboardCatalog {
     this.host.setBoardsReady(ready);
     this.host.notify();
     const snapshot: WorkboardCatalogSnapshot = {
-      boards: boards.map(({ id, name, icon, color }) => ({
+      boards: boards.map(({ id, name, kind, icon, color }) => ({
         id,
         ...(name ? { name } : {}),
+        ...(kind ? { kind } : {}),
         ...(icon ? { icon } : {}),
         ...(color ? { color } : {}),
       })),
