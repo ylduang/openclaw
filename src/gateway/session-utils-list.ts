@@ -26,7 +26,7 @@ import { readPreparedGatewayModelMetadata } from "./server-model-catalog-view.js
 import type { SessionListDiagnostics } from "./session-list-diagnostics.types.js";
 import {
   filterSessionEntries,
-  type SessionListFilteredEntries,
+  type SessionEntrySelection,
   type SessionListFilterParams,
 } from "./session-list-filters.js";
 import {
@@ -48,15 +48,6 @@ import type { SessionRowProjection } from "./session-row-projection.js";
 import type { SessionListRowContext } from "./session-utils-contracts.js";
 import { getSessionDefaults } from "./session-utils-model.js";
 import type { GatewaySessionRow, SessionsListResult } from "./session-utils.types.js";
-
-type SessionEntrySelection = Omit<SessionListFilteredEntries, "ownerEntries"> & {
-  ownerCount: number;
-  totalCount: number;
-  limitApplied?: number;
-  offset: number;
-  nextOffset: number | null;
-  hasMore: boolean;
-};
 
 function resolveSessionsListWindowLimit(limit: number | undefined, offset: number) {
   if (limit === undefined) {
@@ -160,6 +151,7 @@ function buildSessionsListResult(
     owners: list.ownerFacet,
     ...(list.ownerSessionCounts ? { ownerSessionCounts: list.ownerSessionCounts } : {}),
     involvingProfileId: list.involvingProfileId,
+    ...(list.activityExpiresAt !== undefined ? { activityExpiresAt: list.activityExpiresAt } : {}),
     ...(list.activityPulse ? { activityPulse: list.activityPulse } : {}),
     ...(list.people
       ? {
@@ -502,8 +494,9 @@ export async function listProjectedSessions(params: {
   key?: string;
   context?: GatewayRequestContext;
   client?: GatewayClient | null;
+  acceptsSerializedJson?: boolean;
   diagnostics?: SessionListDiagnostics;
-  onResult?: (result: SessionsListResult, sharedRows: readonly GatewaySessionRow[]) => void;
+  onResult?: (result: SessionsListResult) => void;
 }): Promise<SessionsListResult> {
   const { projection, opts, key: exactKey, context, client, diagnostics } = params;
   return projection.withSelectionPreparation(async () => {
@@ -541,9 +534,14 @@ export async function listProjectedSessions(params: {
           metadataPrepared: true,
         });
         diagnostics?.mark("filterSetup");
-        const selection = withAgentRosterFactsBatch(prepared.cfg, () =>
-          runSynchronousWork(selectSessionEntries({ ...filters, defaultLimit: 100 })),
-        );
+        const select = () =>
+          withAgentRosterFactsBatch(prepared.cfg, () =>
+            runSynchronousWork(selectSessionEntries({ ...filters, defaultLimit: 100 })),
+          );
+        const selection =
+          params.acceptsSerializedJson && exactKey === undefined
+            ? presentation.select(opts, select)
+            : select();
         return { now, presentation, prepared, selection };
       } finally {
         diagnostics?.finishSyncCpu("prepareThreadCpuMs", syncCpu);
@@ -583,7 +581,6 @@ export async function listProjectedSessions(params: {
         try {
           let materializedRowCount = 0;
           projection.setArchivePageSize(selection.entries.length);
-          const sharedRows: GatewaySessionRow[] = [];
           const sessions = selection.entries.flatMap(([key], index) => {
             const target = getTarget(key);
             const record =
@@ -604,23 +601,26 @@ export async function listProjectedSessions(params: {
               includeActivitySummary: opts.includeActivitySummary === true,
               rowMode: opts.rowMode,
               omitSentinelChildren: opts.activeOnly && sentinel(record.key),
+              childArchiveFilter: opts.archived ?? false,
             });
             if (!sharedRow) {
               return [];
             }
-            sharedRows.push(sharedRow);
-            const row = { ...sharedRow };
-            bindSessionListRowRead(row, { projection, record, client });
             if ((record.materializedSequence ?? 0) > materializedBefore) {
               materializedRowCount++;
             }
+            if (params.acceptsSerializedJson) {
+              return [sharedRow];
+            }
+            const row = { ...sharedRow };
+            bindSessionListRowRead(row, { projection, record, client });
             return [row];
           });
           diagnostics?.mark("decoration");
           const result = buildSessionsListResult(
             prepared,
             { ...selection, now, storePath: prepared.storePath },
-            sessions,
+            params.acceptsSerializedJson ? presentation.list(sessions, opts) : sessions,
             context?.getCommittedRuntimeConfig?.() ?? cfg,
             client,
           );
@@ -645,7 +645,7 @@ export async function listProjectedSessions(params: {
           }
           diagnostics?.finishSyncCpu("rowThreadCpuMs", syncCpu);
           syncCpu = undefined;
-          params.onResult?.(result, sharedRows);
+          params.onResult?.(result);
           return result;
         } finally {
           diagnostics?.finishSyncCpu("rowThreadCpuMs", syncCpu);

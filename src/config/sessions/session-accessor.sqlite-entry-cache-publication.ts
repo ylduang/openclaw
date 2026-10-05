@@ -1,5 +1,4 @@
 import { AsyncLocalStorage } from "node:async_hooks";
-import path from "node:path";
 import {
   sessionChanges,
   type SessionRowChange,
@@ -12,10 +11,12 @@ import { findOpenClawAgentDatabaseIdentity } from "../../state/openclaw-agent-db
 import { invalidateOpenClawAgentWritableProjections } from "../../state/openclaw-agent-db-lifecycle.js";
 import { invalidateOpenClawAgentReadOnlyProjections } from "../../state/openclaw-agent-db-readonly-scope.js";
 import {
+  applyPendingSessionEntryOwnerChanges,
   pendingSessionEntryPublications,
   preparedSharingReads,
   recordCommittedSessionEntryPublication,
   recordCommittedSessionMetadataPublication,
+  recordCommittedSessionOwnerPublication,
   retainedSharingReads,
 } from "./session-accessor.sqlite-entry-cache-publication-state.js";
 import {
@@ -24,6 +25,9 @@ import {
 } from "./session-accessor.sqlite-entry-cache-state.js";
 import {
   createSessionEntryCreationOperation,
+  assertSessionEntryCreationCurrent,
+  assertSessionEntryCreationTarget,
+  type SessionEntryCreationTarget,
   projectSessionSharingEntry,
   readSessionEntryCreationIdentity,
   type SessionEntryCacheDatabase,
@@ -179,24 +183,11 @@ export function publishSessionEntryWorkerMetadataInvalidation(params: {
   sessionChanges.emit(change);
 }
 
-function assertCreationCurrent(
-  creation: CreationRecord | undefined,
-): asserts creation is CreationRecord {
-  if (!creation?.active) {
-    throw new Error("Session creation publication owner is no longer current");
-  }
-  const source = creation.source;
-  if (source.kind === "file") {
-    source.assertCurrent();
-  } else if (!source.database.db.isOpen || source.database.agentId !== source.agentId) {
-    throw new Error("Session creation publication owner is no longer current");
-  }
-}
-
 function creationMatchesDatabase(creation: CreationRecord, database: SessionEntryCacheDatabase) {
   return creation.source.kind === "native"
     ? creation.source.database.db === database.db
-    : creation.source.agentId === database.agentId &&
+    : creation.source.kind === "file" &&
+        creation.source.agentId === database.agentId &&
         findOpenClawAgentDatabaseIdentity(database)?.identity === creation.source.databaseIdentity;
 }
 
@@ -208,7 +199,12 @@ export async function withSessionEntryCreationPublication<T>(
     bind?: (operation: SessionEntryCreationOperation) => void;
   } & (
     | { database: SessionEntryCacheDatabase & { path: string }; file?: never }
-    | { database?: never; file: Omit<Extract<CreationDatabase, { kind: "file" }>, "kind"> }
+    | {
+        database?: never;
+        file: Omit<Exclude<CreationDatabase, { kind: "native" }>, "kind"> & {
+          kind?: "file" | "actor";
+        };
+      }
   ),
   run: (operation: SessionEntryCreationOperation) => Promise<T>,
 ): Promise<T> {
@@ -237,37 +233,15 @@ export function runWithSessionEntryCreationPublication<T>(
   run: () => Promise<T>,
 ): Promise<T> {
   const creation = preparedSharingChanges.operations.get(operation);
-  assertCreationCurrent(creation);
+  assertSessionEntryCreationCurrent(creation);
   return preparedSharingChanges.current.run(creation, run);
 }
 
 export function assertSessionEntryCreationPublication(
   operation: SessionEntryCreationOperation,
-  target: {
-    agentId: string;
-    sessionKey: string;
-    paths: ReadonlySet<string>;
-    databaseIdentity?: string;
-  },
+  target: SessionEntryCreationTarget,
 ): void {
-  const creation = preparedSharingChanges.operations.get(operation);
-  assertCreationCurrent(creation);
-  const sourcePath =
-    creation.source.kind === "native" ? creation.source.database.path : creation.source.path;
-  const matchesDatabaseIdentity =
-    creation.source.kind === "file" &&
-    target.databaseIdentity === `file:${creation.source.databaseIdentity}`;
-  const matchesTarget =
-    target.databaseIdentity !== undefined
-      ? matchesDatabaseIdentity
-      : target.paths.has(path.resolve(sourcePath));
-  if (
-    creation.agentId !== target.agentId ||
-    creation.sessionKey !== target.sessionKey ||
-    !matchesTarget
-  ) {
-    throw new Error("Session creation publication owner is no longer current");
-  }
+  assertSessionEntryCreationTarget(preparedSharingChanges.operations.get(operation), target);
 }
 
 export function readSessionEntryCreationTransition(
@@ -281,7 +255,7 @@ export function readSessionEntryCreationTransition(
     return undefined;
   }
   try {
-    assertCreationCurrent(creation);
+    assertSessionEntryCreationCurrent(creation);
   } catch {
     return undefined;
   }
@@ -371,15 +345,7 @@ function publishSessionSharingFieldChange(
     database,
     () => {
       if (change.kind === "owner") {
-        const identity = findOpenClawAgentDatabaseIdentity(database)?.identity;
-        if (typeof identity === "string") {
-          for (const pending of pendingSessionEntryPublications.get(
-            `file:${identity}\0${sessionKey}`,
-          ) ?? []) {
-            // A field update supersedes its value, not the pending entry's generation fence.
-            pending.ownerChanges.set(sessionKey, structuredClone(change));
-          }
-        }
+        recordCommittedSessionOwnerPublication(database, sessionKey, change);
       }
       for (const read of retainedSharingReads(database, sessionKey) ?? []) {
         if (read.acquisition) {
@@ -569,26 +535,10 @@ export function retainSessionEntryWorkerPublication(params: {
       if (!pending) {
         return undefined;
       }
-      let replacement = receipt?.kind === "session-entry-replacements" ? receipt : undefined;
-      if (replacement && owner.ownerChanges.size > 0) {
-        const current = new Map(replacement.current);
-        for (const [sessionKey, change] of owner.ownerChanges) {
-          const entry = current.get(sessionKey);
-          if (
-            !entry ||
-            entry.sessionId !== change.sessionId ||
-            (entry.lifecycleRevision ?? null) !== change.lifecycleRevision
-          ) {
-            continue;
-          }
-          const { owner: _previousOwner, ...metadata } = entry;
-          current.set(
-            sessionKey,
-            freezeJsonSnapshot({ ...metadata, ...(change.owner ? { owner: change.owner } : {}) }),
-          );
-        }
-        replacement = { ...replacement, current };
-      }
+      const replacement = applyPendingSessionEntryOwnerChanges(
+        receipt?.kind === "session-entry-replacements" ? receipt : undefined,
+        owner.ownerChanges,
+      );
       const initialization =
         receipt?.kind === "session-transcript-initialized" ? receipt : undefined;
       const current = (sessionKey: string) => !owner.superseded.has(sessionKey);

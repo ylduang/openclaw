@@ -13,7 +13,6 @@ import {
 } from "../agents/agent-scope.js";
 import { resolveExecDefaults } from "../agents/exec-defaults.js";
 import { resolveAgentAvatarUrlFromSource } from "../agents/identity-avatar-file.js";
-import type { ModelCatalogEntry } from "../agents/model-catalog.js";
 import { splitTrailingAuthProfile } from "../agents/model-ref-profile.js";
 import {
   buildModelAliasIndex,
@@ -32,9 +31,10 @@ import {
   type SessionEntry,
   type SessionScope,
 } from "../config/sessions.js";
-import { isInternalSessionEffectsKey } from "../config/sessions/internal-session-key.js";
-import type { SessionEntryListScope } from "../config/sessions/session-accessor.js";
-import type { QualifiedSessionEntryAccessTarget } from "../config/sessions/session-accessor.types.js";
+import type {
+  QualifiedSessionEntryAccessTarget,
+  SessionEntryReadScope,
+} from "../config/sessions/session-accessor.types.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { resolveExecPolicyForMode } from "../infra/exec-approvals-core.js";
 import { loadExecApprovalsReadOnlyAsync } from "../infra/exec-approvals-store.js";
@@ -56,7 +56,10 @@ import {
   resolveGatewaySessionStoreTargetWithStore,
 } from "./session-utils-store-lookup.js";
 import { withQualifiedGatewaySessionStoreTarget } from "./session-utils-store-retained.js";
-import { findCanonicalStoreMatch } from "./session-utils-store-selection.js";
+import {
+  findCanonicalStoreMatch,
+  omitInternalSessionEffectsEntries,
+} from "./session-utils-store-selection.js";
 import type { GatewayAgentRow, SessionListModelCatalog } from "./session-utils.types.js";
 import { projectWorkerPlacementAgentRuntime } from "./worker-environments/placement-session-runtime.js";
 
@@ -138,7 +141,7 @@ function readAcpMetaForDeletedAgentCheck(params: {
 function loadSessionEntryWithMode(
   sessionKey: string,
   opts:
-    | (Pick<SessionEntryListScope, "agentId" | "clone" | "projection" | "env"> & {
+    | (Pick<SessionEntryReadScope, "agentId" | "clone" | "projection" | "env"> & {
         includeStoreChildEntries?: boolean;
         targetDiscoveryCache?: GatewaySessionStoreDiscoveryCache;
       })
@@ -162,11 +165,7 @@ function loadSessionEntryWithMode(
   const storePath = target.storePath;
   const store = target.store;
   if (!readOnly) {
-    for (const storeKey of target.storeKeys) {
-      if (isInternalSessionEffectsKey(storeKey)) {
-        delete store[storeKey];
-      }
-    }
+    omitInternalSessionEffectsEntries(store, target.storeKeys);
   }
   const canonicalMatch = findCanonicalStoreMatch(store, target.storeKeys);
   const legacyKey = canonicalMatch?.key !== target.canonicalKey ? canonicalMatch?.key : undefined;
@@ -191,7 +190,7 @@ function loadSessionEntryWithMode(
 
 export function loadGatewaySessionEntry(
   sessionKey: string,
-  opts?: Pick<SessionEntryListScope, "agentId" | "clone" | "projection" | "env">,
+  opts?: Pick<SessionEntryReadScope, "agentId" | "clone" | "projection" | "env">,
   cfg?: OpenClawConfig,
 ) {
   return loadSessionEntryWithMode(sessionKey, opts, false, cfg);
@@ -202,7 +201,7 @@ export function loadGatewaySessionEntryReadOnly(
   opts?: {
     includeStoreChildEntries?: boolean;
     targetDiscoveryCache?: GatewaySessionStoreDiscoveryCache;
-  } & Pick<SessionEntryListScope, "agentId" | "clone" | "projection" | "env">,
+  } & Pick<SessionEntryReadScope, "agentId" | "clone" | "projection" | "env">,
   cfg?: OpenClawConfig,
 ) {
   return loadSessionEntryWithMode(sessionKey, opts, true, cfg);
@@ -212,7 +211,7 @@ export function loadGatewaySessionEntryReadOnly(
 export async function withGatewaySessionEntry<T>(
   sessionKey: string,
   opts:
-    | (Pick<SessionEntryListScope, "agentId" | "projection" | "env"> & {
+    | (Pick<SessionEntryReadScope, "agentId" | "projection" | "env"> & {
         includeMembership?: boolean;
       })
     | undefined,
@@ -232,11 +231,7 @@ export async function withGatewaySessionEntry<T>(
   return withGatewaySessionStoreTarget(
     { cfg, key: sessionKey, ...opts },
     (target, membership, assertSourceCurrent) => {
-      for (const key of target.storeKeys) {
-        if (isInternalSessionEffectsKey(key)) {
-          delete target.store[key];
-        }
-      }
+      omitInternalSessionEffectsEntries(target.store, target.storeKeys);
       const canonicalMatch = findCanonicalStoreMatch(target.store, target.storeKeys);
       const assertCurrent = () => {
         assertSourceCurrent();
@@ -401,7 +396,6 @@ function resolvedPermissionLabel(
 
 export async function listAgentsForGateway(
   cfg: OpenClawConfig,
-  modelCatalog?: ModelCatalogEntry[],
   options?: {
     modelCatalogByAgentId?: SessionListModelCatalog;
     includeSystem?: boolean;
@@ -490,20 +484,15 @@ export async function listAgentsForGateway(
     const hasAgentCatalog = options?.modelCatalogByAgentId?.has(id);
     // Unconfigured system rows inherit the default catalog; keep its provider
     // policy attached. A configured owner with no catalog must not inherit it.
-    const preparedCatalog = hasAgentCatalog
-      ? options?.modelCatalogByAgentId?.get(id)
-      : modelCatalog
-        ? undefined
-        : options?.modelCatalogByAgentId?.get(basic.defaultId);
-    const agentModelCatalog = hasAgentCatalog
-      ? preparedCatalog?.entries
-      : (modelCatalog ?? preparedCatalog?.entries);
+    const preparedCatalog = options?.modelCatalogByAgentId?.get(
+      hasAgentCatalog ? id : basic.defaultId,
+    );
     const thinkingProfile = resolveGatewayModelThinkingProfile({
       cfg,
       agentId: id,
       provider: resolvedModel.provider,
       model: resolvedModel.model,
-      modelCatalog: agentModelCatalog,
+      modelCatalog: preparedCatalog?.entries,
       sessionKey,
       providerPolicySource: preparedCatalog?.pluginRegistry,
     });
