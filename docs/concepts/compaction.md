@@ -173,7 +173,19 @@ that size. This is useful for long-running sessions where provider-side context
 management may keep model context healthy while persisted transcript history
 keeps growing. Set a positive byte count or size string such as `"20mb"` to opt
 in; `0` or an unset value disables the guard. It does not split raw bytes; it
-asks the normal compaction pipeline to create a semantic summary. For Codex
+asks the normal compaction pipeline to create a semantic summary. If compaction
+is declined or leaves history over the limit, the turn continues with a bounded
+view of recent history. OpenClaw omits the oldest whole turns, keeps tool calls
+with their results, and preserves the system instructions and current request.
+An oversized historical turn may be omitted in full. This fallback does not
+rewrite saved messages or count a failed attempt as successful compaction.
+It shows a notice even with compaction notifications disabled; resend any
+essential details from omitted history. The bound applies to selected history,
+not the fixed instructions, tool definitions, or current request.
+
+Suppressed byte-compaction retries still use a bounded view on subsequent turns.
+Retained history remains available on disk and may continue growing; this is not
+a storage-retention limit. For Codex
 app-server sessions, the same threshold caps native rollout transcripts and
 oversized native threads restart fresh.
 
@@ -231,6 +243,16 @@ When an embedded Responses provider returns a compacted window, OpenClaw preserv
 After a successful continuation, OpenClaw uses the provider's measured context usage when the saved request prefix still matches the current checkpoint, conversation, and provider identity. New content and current request overhead still receive a local estimate. Edited or incompatible history falls back to estimation without changing the saved conversation.
 
 Predicted context pressure uses budget compaction before the next request. The public OpenAI Responses API and native xAI can use their compact endpoint by default; `params.responsesCompactEndpoint: false` disables that endpoint for a model. A provider-confirmed overflow keeps the client recovery path because compact endpoints also require their input to fit. Endpoint failures fall back to client-side summarization.
+
+Once the foreground request budget is prepared, a returned endpoint window must
+also fit beside its fixed instructions, tools, pending input, and reserve before
+OpenClaw saves it. If retained user messages still exceed that budget,
+client-side compaction selects a smaller recent tail instead of retrying the
+same oversized window.
+
+If the pending input alone fills the model's context window, recovery asks for a
+smaller message or a larger-context model without repeatedly compacting history.
+Later messages retain their normal recovery budget.
 
 If an older version or transcript redaction removes the complete window needed for replay, OpenClaw asks you to run `/compact`. That command rebuilds context from the saved conversation through client-side compaction. It does not guess the missing provider context or delete the transcript.
 

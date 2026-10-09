@@ -38,7 +38,7 @@ import type {
   SessionEntryCreateWithTranscriptOptions,
 } from "./session-accessor.types.js";
 import type { CanonicalSessionReaderContinuation } from "./session-canonical-key.js";
-import type { SessionMaintenancePreservationSnapshot } from "./store-maintenance-preserve-snapshot.js";
+import type { SessionMaintenancePreservationSnapshot } from "./store-maintenance-preserve-snapshot.types.js";
 import type { ResolvedSessionMaintenanceConfig } from "./store-maintenance.js";
 import type { InternalSessionEntry as SessionEntry } from "./types.js";
 
@@ -242,6 +242,7 @@ export type SessionMaintenanceMetadataResult =
       kind: "maintenance-plan";
       value: SessionEntryMaintenancePlan;
       ageSnapshot: SessionMaintenanceAgeSnapshot;
+      nextAt: number | undefined;
       readOnlyInput?: SessionEntryMaintenanceInput;
     };
 

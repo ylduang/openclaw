@@ -72,6 +72,7 @@ import {
   buildAgentMainSessionKey,
   isAcpSessionKey,
   normalizeMainKey,
+  toAgentStoreSessionKey,
 } from "../../routing/session-key.js";
 import { resolveAgentHarnessSessionContextError } from "../../sessions/agent-harness-session-key.js";
 import { isInterSessionInputProvenance } from "../../sessions/input-provenance.js";
@@ -131,6 +132,7 @@ import {
 } from "./session-init-conflict-retry.js";
 import type { SessionInitResult } from "./session-init.types.js";
 import {
+  prepareReplySessionInitialization,
   resolveInitializationSessionReader,
   type InitSessionStateParams,
   type InitSessionStateAttemptContext,
@@ -146,7 +148,7 @@ import {
 } from "./session-reset-cleanup.js";
 import { resolveAuthorizedSessionResetCommand } from "./session-reset-command.js";
 import { resolveReplySessionRolloverState } from "./session-rollover-state.js";
-import { stripThreadFromSessionRoute, stripThreadId } from "./session-route-reset.js";
+import { withoutThreadDelivery } from "./session-route-reset.js";
 
 const log = createSubsystemLogger("session-init");
 
@@ -220,17 +222,6 @@ async function resolveInitSessionStateAttemptContext(
   };
 }
 
-function withoutThreadDelivery(entry: SessionEntry | undefined) {
-  if (entry?.delivery?.kind === "internal") {
-    return entry.delivery;
-  }
-  return normalizeSessionDeliveryState({
-    route: stripThreadFromSessionRoute(sessionDeliveryRoute(entry)),
-    context: stripThreadId(deliveryContextFromSession(entry)),
-    origin: stripThreadId(sessionDeliveryOrigin(entry)),
-  });
-}
-
 type ReplySessionPreprocessingState = {
   sessionEntry?: SessionEntry;
   sessionKey: string;
@@ -289,38 +280,10 @@ async function initSessionStateAttempt(params: InitSessionStateParams): Promise<
     }
   }
   params.signal?.throwIfAborted();
-  const parentSessionKey = normalizeOptionalString(params.ctx.ParentSessionKey);
-  const snapshot = await loadReplySessionInitializationSnapshot(
-    {
-      agentId: attemptContext.agentId,
-      storePath: attemptContext.storePath,
-      sessionKey: attemptContext.sessionKey,
-      relatedSessionKeys: parentSessionKey ? [parentSessionKey] : [],
-    },
-    {
-      reader: resolveInitializationSessionReader(params, attemptContext),
-      assertCurrent: () => params.signal?.throwIfAborted(),
-    },
+  const { snapshot, parentSessionKey } = await prepareReplySessionInitialization(
+    params,
+    attemptContext,
   );
-  const { restoreSessionColdTranscript } =
-    await import("../../config/sessions/session-cold-storage.js");
-  const restoreTargets = [
-    attemptContext.sessionKey,
-    ...(parentSessionKey ? [parentSessionKey] : []),
-  ].map((sessionKey) => ({ sessionKey, sessionId: snapshot.readEntry(sessionKey)?.sessionId }));
-  // Restore before the writer lane: reset hooks and parent forks read synchronously inside it.
-  for (const { sessionKey, sessionId } of restoreTargets) {
-    if (sessionId) {
-      params.signal?.throwIfAborted();
-      await restoreSessionColdTranscript({
-        sessionKey,
-        sessionId,
-        agentId: attemptContext.agentId,
-        storePath: attemptContext.storePath,
-      });
-    }
-  }
-  params.signal?.throwIfAborted();
   // Creation hooks, parent forks, and legacy-main retirement can touch other sessions.
   const storeWriterIdentity =
     snapshot.currentEntry &&
@@ -529,7 +492,6 @@ async function initSessionStateAttemptLocked(
     // Reacquire store-wide before a newly observed creation can invoke arbitrary hooks.
     throw new ReplySessionInitConflictError(sessionKey);
   }
-  const createdNewEntry = entry === undefined;
   const parentSessionKey = normalizeOptionalString(ctx.ParentSessionKey);
   const parentForkSourceEntry =
     parentSessionKey && parentSessionKey !== sessionKey
@@ -648,7 +610,6 @@ async function initSessionStateAttemptLocked(
     (((lockedModelSelection || isSystemEvent) && canReuseExistingEntry) ||
       ((((pinExpectedExistingSession || reconnectResumeRequested || softResetAllowed) &&
         canReuseExistingEntry) ||
-        recoverTerminalVisibleEntry ||
         (entryFreshness?.fresh ?? false)) &&
         !terminalMainTranscriptNewerThanRegistry));
   const activeReplyOperation = replyRunRegistry.get(sessionKey);
@@ -663,16 +624,13 @@ async function initSessionStateAttemptLocked(
   // A bare stale result is the legacy updatedAt=0 pending-reset tombstone.
   const effectiveFreshEntry = deferImplicitRolloverForActiveRun || freshEntry;
   // Keep the owed reset pending until the active writer completes.
-  const retainPendingResetMarker =
-    deferImplicitRolloverForActiveRun && !resetTriggered && entry?.updatedAt === 0;
+  const retainPendingResetMarker = deferImplicitRolloverForActiveRun && entry?.updatedAt === 0;
   // Explicit and scheduled resets both retain the prior entry for lifecycle hooks.
   const previousSessionEntry =
     (resetTriggered || !effectiveFreshEntry) && entry ? { ...entry } : undefined;
   const previousSessionEndReason = resetTriggered
     ? resolveExplicitSessionEndReason(matchedResetTriggerLower)
-    : entry
-      ? entryFreshness?.staleReason
-      : undefined;
+    : entryFreshness?.staleReason;
   const lifecycleMutationMatches = Boolean(
     previousSessionEntry &&
     lifecycleMutationIdentity?.sessionKey === sessionKey &&
@@ -692,10 +650,10 @@ async function initSessionStateAttemptLocked(
     entry && recoverTerminalVisibleEntry
       ? recoverTerminalSessionEntryForVisibleTurn(entry)
       : undefined;
-  const reusableEntry = recoveredTerminalEntry ?? entry;
-
   const baseEntry =
-    !resetTriggered && effectiveFreshEntry && canReuseExistingEntry ? reusableEntry : undefined;
+    !resetTriggered && effectiveFreshEntry && canReuseExistingEntry
+      ? (recoveredTerminalEntry ?? entry)
+      : undefined;
   const isNewSession = !baseEntry;
   const systemSent = baseEntry?.systemSent ?? false;
   const abortedLastRun = baseEntry?.abortedLastRun ?? false;
@@ -862,10 +820,10 @@ async function initSessionStateAttemptLocked(
         resetTriggered,
       })
     : undefined;
-  const resetBoundaryAppended = resetBoundary !== undefined;
   let previousSessionMemory: SessionMemoryTranscript | undefined;
   let previousSessionResetMessages: unknown[] | undefined;
   const committed = await commitReplySessionInitialization({
+    bindCreation: params.bindSessionCreation,
     ...sessionTarget,
     commitGuard: !entry
       ? () => {
@@ -924,7 +882,7 @@ async function initSessionStateAttemptLocked(
           sessionId: currentEntry.sessionId,
         });
       }
-      if (resetBoundaryAppended) {
+      if (resetBoundary) {
         clearAllCliSessions(entryToCommit);
         entryToCommit.agentHarnessId = undefined;
       }
@@ -981,10 +939,10 @@ async function initSessionStateAttemptLocked(
     });
   }
   clearBootstrapSnapshotOnSessionBoundary({
-    boundaryAppended: resetBoundaryAppended,
+    boundaryAppended: resetBoundary !== undefined,
     sessionKey,
   });
-  if (createdNewEntry) {
+  if (!entry) {
     await recordSessionCreated(cfg, { sessionKey, agentId, entry: sessionEntry });
   }
   await registerMainSessionGroupWatch({
@@ -1035,7 +993,9 @@ async function initSessionStateAttemptLocked(
     void runWithGatewayIndependentRootWorkContinuation(async () => {
       await cleanupBrowserSessionsForLifecycleEnd({
         cfg,
-        sessionKeys: [previousSessionEntry.sessionId, sessionKey, runtimePolicySessionKey],
+        sessionKeys: [previousSessionEntry.sessionId, sessionKey, runtimePolicySessionKey].map(
+          (requestKey) => toAgentStoreSessionKey({ agentId, requestKey }),
+        ),
         onWarn: (message) => log.warn(message),
         onError: (error) => log.warn(`browser tab cleanup failed: ${String(error)}`),
       });
