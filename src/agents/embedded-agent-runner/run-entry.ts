@@ -40,6 +40,7 @@ import {
   resolveEmbeddedCyberFailoverConfig,
   resolveEmbeddedCyberFailoverTarget,
 } from "./embedded-cyber-failover.js";
+import { persistModelFallbackTranscriptNotice } from "./model-fallback-transcript.js";
 import {
   classifyEmbeddedAgentRunResultForModelFallback,
   mergeEmbeddedAgentRunResultForModelFallbackExhaustion,
@@ -170,16 +171,20 @@ async function runEmbeddedAgentEntryInternal<T extends EmbeddedAgentRunResult>(
       emitAgentEvent(event);
     }
   };
+  const awaitSessionDiffBaseline = params.modelResolve?.awaitSessionDiffBaseline;
   const contextEngineLogicalTurnLease = await createContextEngineLogicalTurnLease({
     identity: params.identity,
     config: params.selection.cfg,
     agentDir: params.selection.agentDir,
     workspaceDir: params.harness.workspaceDir,
+    awaitSessionDiffBaseline: awaitSessionDiffBaseline
+      ? async () => {
+          await awaitSessionDiffBaseline();
+          assertCurrent();
+        }
+      : undefined,
   });
-  const assistantErrorTranscript = createAssistantErrorTranscript({
-    runId: params.identity.runId,
-    config: params.selection.cfg,
-  });
+  const assistantErrorTranscript = createAssistantErrorTranscript();
   let failed = true;
   let candidateIndex = 0;
   const committedSideEffect =
@@ -285,7 +290,13 @@ async function runEmbeddedAgentEntryInternal<T extends EmbeddedAgentRunResult>(
           }
         },
         prepareAgentHarnessRuntime: prepareHarnessRuntime,
-        onFallbackStep: params.onFallbackStep,
+        onFallbackStep: async (step) => {
+          try {
+            await params.onFallbackStep?.(step);
+          } finally {
+            await persistModelFallbackTranscriptNotice(params, step, assertCurrent);
+          }
+        },
         ...(params.behavior.kind === "maintenance"
           ? {}
           : {
@@ -623,7 +634,7 @@ async function runEmbeddedAgentEntryInternal<T extends EmbeddedAgentRunResult>(
   } finally {
     forgetPromptBuildDrainCacheForRun(params.identity.runId);
     try {
-      await assistantErrorTranscript.settle(failed && !params.abortSignal?.aborted);
+      assistantErrorTranscript.settle(failed && !params.abortSignal?.aborted);
     } finally {
       await contextEngineLogicalTurnLease.dispose();
     }

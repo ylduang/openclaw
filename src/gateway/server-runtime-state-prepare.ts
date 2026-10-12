@@ -187,14 +187,16 @@ export async function prepareGatewayKernelState(params: {
           workerPlacementModule.createGatewayWorkerPlacementRuntime({
             scheduler,
             placements: workerEnvironmentStartup.placementStore,
+            initialPlacements: await workerEnvironmentStartup.placementStore.listAsync(),
             getCommittedRuntimeConfig,
             environments: workerEnvironmentService,
             gatewayNamespace: nodeWorkerGatewayNamespace,
             nodeWorkerBundleRetention,
             getSessionChangeContext: () => pluginGatewayContext.current,
             persistAbandonedPartial: async ({ sessionId, sessionKey, agentId, runId }) => {
-              // Placement runtime starts before chat state exists; moves invoke this only after startup.
-              const text = connectionState.chatRunState.resolveBuffer(runId, { final: true }).text;
+              // Placement runtime starts before chat state exists; callers run only after startup.
+              const partial = connectionState.chatRunState.resolveBuffer(runId, { final: true });
+              const text = partial.displayText ?? partial.text;
               if (!text.trim()) {
                 return;
               }
@@ -437,7 +439,7 @@ export async function prepareGatewayKernelState(params: {
   channelManager.setAutostartSuppression(opts.channelAutostartSuppression ?? null);
   const sidecarStartup = opts.sidecarStartup ?? "start";
   const isGatewayStartupPending = () =>
-    !startupState.sidecarsReady && !lifecycle.closePreludeStarted;
+    (!startupState.dispatchReady || !startupState.sidecarsReady) && !lifecycle.closePreludeStarted;
   const startupCheckerDeps = {
     startedAt: serverStartedAt,
     getStartupPending: isGatewayStartupPending,
