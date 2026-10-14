@@ -106,7 +106,7 @@ async function register(...entries: SubagentRunRecord[]) {
   );
 }
 
-it("streams bounded restore batches in one read and retains snapshot row versions", async () => {
+it("streams bounded restore batches in one read and retains one snapshot", async () => {
   const entries = [3, 1, 2].map((createdAt, index) =>
     Object.assign(entry(`paged-${index}`), {
       createdAt,
@@ -115,9 +115,6 @@ it("streams bounded restore batches in one read and retains snapshot row version
   );
   const fixtureRows = new Map(entries.map((row) => [row.runId, row]));
   saveSubagentRegistryChangesToSqlite(fixtureRows, [...fixtureRows.keys()]);
-  openOpenClawStateDatabase()
-    .db.prepare("UPDATE subagent_runs SET payload_json = payload_json || ' ' WHERE run_id = ?")
-    .run("paged-0");
   const read = stateReads.executeExistingOpenClawStateRead;
   const payloadBytes: number[] = [];
   const observe = vi
@@ -713,7 +710,7 @@ it.each(["before ACK", "inside failing callback"] as const)(
   },
 );
 
-it("retains prepared announcement authority across bookkeeping and revokes it for a new terminal result", async () => {
+it("retains prepared announcement authority across bookkeeping and revokes it for a changed terminal outcome", async () => {
   const child = entry("announcement");
   child.execution = {
     status: "terminal",
@@ -747,7 +744,7 @@ it("retains prepared announcement authority across bookkeeping and revokes it fo
   expect(prepared.text).toBe("child result");
   expect(prepared.isCurrent()).toBe(true);
   await change(child.runId, (row) => {
-    row.completion!.terminalReply = { disposition: "silent" };
+    row.execution.outcome = { status: "error" };
   });
   expect(prepared.isCurrent()).toBe(false);
 });

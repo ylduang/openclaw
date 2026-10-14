@@ -2,7 +2,7 @@
 // caching behavior, delivery context, and policy filtering.
 
 import { expectDefined } from "@openclaw/normalization-core";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { ErrorCodes } from "../../../packages/gateway-protocol/src/index.js";
 import type { McpToolCatalog } from "../../agents/agent-bundle-mcp-types.js";
 import { makeProviderModelFixture } from "../../agents/test-helpers/provider-model-fixture.js";
@@ -13,6 +13,7 @@ import { resolveIncognitoOpenClawAgentSqlitePath } from "../../state/openclaw-ag
 import { toolsEffectiveHandlers, testing } from "./tools-effective.js";
 
 type InventoryModule = typeof import("../../agents/tools-effective-inventory.js");
+type SessionLookup = typeof import("../session-utils.js").loadGatewaySessionEntryReadOnlyAsync;
 type SessionMcpRuntimeView = Pick<
   NonNullable<
     ReturnType<typeof import("../../agents/agent-bundle-mcp-tools.js").peekSessionMcpRuntime>
@@ -64,33 +65,33 @@ const runtimeMocks = vi.hoisted(() => ({
   resolveRuntimeConfigCacheKey: vi.fn(() => "runtime:1:test"),
   resolveAgentDir: vi.fn(() => "/tmp/agents/main/agent"),
   getRuntimeConfig: vi.fn(() => ({})),
-  loadSessionEntry: vi.fn<typeof import("../session-utils.js").loadGatewaySessionEntryReadOnly>(
-    () => ({
-      cfg: {},
-      agentId: "main",
-      storePath: "/tmp/sessions.json",
-      store: {},
-      canonicalKey: "main:abc",
-      entry: {
-        sessionId: "session-1",
-        updatedAt: 1,
-        lastChannel: "telegram",
-        lastAccountId: "acct-1",
-        lastThreadId: "thread-2",
-        lastTo: "channel-1",
-        groupId: "group-4",
-        groupChannel: "#ops",
-        space: "workspace-5",
-        chatType: "group",
-        modelProvider: "openai",
-        model: "gpt-4.1",
-        spawnedBy: "agent:main:telegram:group:parent-group",
-        spawnedWorkspaceDir: undefined as string | undefined,
-      },
-      storeKeys: ["main:abc"],
-      legacyKey: undefined,
-    }),
-  ),
+  loadSessionEntry: vi.fn<
+    (...args: Parameters<SessionLookup>) => Awaited<ReturnType<SessionLookup>>
+  >(() => ({
+    cfg: {},
+    agentId: "main",
+    storePath: "/tmp/sessions.json",
+    store: {},
+    canonicalKey: "main:abc",
+    entry: {
+      sessionId: "session-1",
+      updatedAt: 1,
+      lastChannel: "telegram",
+      lastAccountId: "acct-1",
+      lastThreadId: "thread-2",
+      lastTo: "channel-1",
+      groupId: "group-4",
+      groupChannel: "#ops",
+      space: "workspace-5",
+      chatType: "group",
+      modelProvider: "openai",
+      model: "gpt-4.1",
+      spawnedBy: "agent:main:telegram:group:parent-group",
+      spawnedWorkspaceDir: undefined as string | undefined,
+    },
+    storeKeys: ["main:abc"],
+    legacyKey: undefined,
+  })),
   peekSessionMcpRuntime: vi.fn<() => SessionMcpRuntimeView | undefined>(() => undefined),
   resolveSessionMcpConfigSummary: vi.fn(() => ({
     fingerprint: "mcp:1:test",
@@ -360,7 +361,6 @@ describe("tools.effective handler", () => {
       mock.mockReset();
     }
     testing.resetToolsEffectiveCacheForTest();
-    testing.setToolsEffectiveNowForTest();
     nodePluginToolSnapshotMocks.version = 1;
     runtimeMocks.resolveAgentWorkspaceDir.mockReturnValue("/tmp/workspace-main");
     runtimeMocks.resolveAgentDir.mockReturnValue("/tmp/agents/main/agent");
@@ -518,7 +518,8 @@ describe("tools.effective handler", () => {
 
   it("returns stale cached base inventory immediately while refreshing in the background", async () => {
     let now = 1_000;
-    testing.setToolsEffectiveNowForTest(() => now);
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+    onTestFinished(() => clock.mockRestore());
     const stalePayload = makeCoreInventory({
       id: "read",
       label: "Read",

@@ -434,13 +434,13 @@ export async function appendSessionTurnInWorker(
         };
         return operation.run(
           async () => {
-            const hot = inputActor.snapshot(authority);
-            const replicaPreparation = hot && prepareSessionInputFromReplica(plan, hot, scope);
-            if (replicaPreparation) {
-              return replicaPreparation;
-            }
             if (memory) {
-              return actor.storage!.read({ type: "session.turn.prepare", input: plan }, authority);
+              const hot = inputActor.snapshot(authority);
+              const replicaPreparation = hot && prepareSessionInputFromReplica(plan, hot, scope);
+              return (
+                replicaPreparation ??
+                actor.storage!.read({ type: "session.turn.prepare", input: plan }, authority)
+              );
             }
             return withSessionEntryWorker(
               database,
@@ -475,11 +475,10 @@ export async function appendSessionTurnInWorker(
               { ...actor, snapshot: (current) => inputActor.snapshot(current) },
               authority,
               async (snapshot) => {
-                const before = snapshot;
-                // Rebase the cache version, retaining the originally selected lifecycle.
-                if (before) {
+                // Metadata may advance; the writer checks the captured lifecycle at commit.
+                if (snapshot) {
                   expectedState ??= buildRestartRecoveryExpectedState(
-                    before.entry ?? { sessionId: options.expectedSessionId, updatedAt: 0 },
+                    snapshot.entry ?? { sessionId: options.expectedSessionId, updatedAt: 0 },
                   );
                 }
                 if (!expectedState) {
@@ -507,8 +506,6 @@ export async function appendSessionTurnInWorker(
                 const command = {
                   commandId: randomUUID(),
                   phaseId: `${phase}:${options.expectedSessionId}`,
-                  // Memory commands use their FIFO owner's current state, not a cached version.
-                  expected: memory ? undefined : before?.version,
                   expectedState,
                   lifecycle: {},
                   turn: plan,

@@ -133,7 +133,7 @@ export async function preparePendingInputStore(
     return operation;
   };
   const nativeMutation = (
-    input: PendingInputMutation,
+    input: Extract<PendingInputMutation, { kind: "complete" }>,
     guard: (stage: "transaction" | "commit", facts?: PendingInputCustodyGrant) => void,
   ) => {
     assertOpen();
@@ -202,28 +202,6 @@ export async function preparePendingInputStore(
         (async () => {
           assertOpen();
           assertCurrent();
-          if (inputActor && input.kind === "stage") {
-            const authority = { assertCurrent, authorize: assertCurrent };
-            const hot =
-              inputActor.actor.snapshot(authority) ?? (await inputActor.actor.read(authority));
-            if (hot.entry?.sessionId !== input.sessionId) {
-              return { kind: "stage" as const, current: false };
-            }
-            if (
-              hot.transcript.modelContext.kind === "resident" &&
-              !hot.pendingInputs.some((row) => row.idempotency_key === input.idempotencyKey) &&
-              !hot.completionKeys.includes(input.idempotencyKey) &&
-              !hot.transcript.idempotency.some((row) => row.key === input.idempotencyKey)
-            ) {
-              return {
-                kind: "stage" as const,
-                current: true,
-                existing: undefined,
-                previous: undefined,
-                committed: undefined,
-              };
-            }
-          }
           return withSessionEntryWorker(
             options,
             identity?.key.slice(5),
@@ -244,7 +222,7 @@ export async function preparePendingInputStore(
         })(),
       );
     },
-    // Released SDK completion retains immediate transaction semantics until the next major.
+    // Released SDK completion retains immediate transaction semantics; stage/finish use workers.
     nativeMutation,
     mutate(
       input: PendingInputMutation,

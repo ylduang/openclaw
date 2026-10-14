@@ -2,11 +2,16 @@ import { channel } from "node:diagnostics_channel";
 import { performance } from "node:perf_hooks";
 import { isMainThread, threadId } from "node:worker_threads";
 import { racePromiseWithAbortSignal } from "../../packages/retry/src/index.js";
+import { runWithSqliteDatabaseAdmissionTurn } from "../infra/sqlite-database-admission-turn.js";
 import {
   assertExistingDatabaseIdentity,
   readDatabasePathIdentitySync,
   type DatabasePathIdentity,
 } from "../infra/sqlite-worker-identity.js";
+import {
+  withSqliteWorkerReservationObservation,
+  type SqliteWorkerReservationObservation,
+} from "../infra/worker-request-diagnostics.js";
 import { getChildLogger } from "../logging/logger.js";
 import { runStoreWriterAcquisitions } from "../shared/store-writer-acquisitions.js";
 import {
@@ -18,7 +23,16 @@ import type { OpenClawAgentDatabaseOptions } from "./openclaw-agent-db-contract.
 import { resolveOpenClawAgentSqlitePath } from "./openclaw-agent-db.paths.js";
 import { agentDatabaseWriteAdmissionState as admission } from "./openclaw-agent-write-admission-state.js";
 
+type ReservationTiming = NonNullable<
+  NonNullable<ReturnType<typeof admission.queues.get>>["holder"]
+> & {
+  blockingOperation?: string;
+  blockingCaller?: string;
+  blockingWorker?: SqliteWorkerReservationObservation;
+};
+
 const reservationDiagnostics = channel("openclaw.agent-database.reservation");
+type WorkerReservationCaller = "session-reclamation.close";
 type DirectReservationCaller =
   | "session-manager.write"
   | "session-manager.note"
@@ -30,22 +44,26 @@ type DirectReservationCaller =
 function observeWriteAdmission<T>(
   operation: "direct" | "worker" | "ordered-read",
   timing: StoreWriterTiming | undefined,
-  run: (timing: StoreWriterTiming) => Promise<T>,
-  caller?: DirectReservationCaller,
+  run: (timing: ReservationTiming) => Promise<T>,
+  caller?: DirectReservationCaller | WorkerReservationCaller,
+  worker?: SqliteWorkerReservationObservation,
 ): Promise<T> {
+  const observed: ReservationTiming = timing ?? {};
+  observed.operation ??= operation;
+  observed.caller ??= caller;
+  observed.worker ??= worker;
   // Supplied timing belongs to the session-write diagnostic owner, or to an
   // enclosing observer here. Neither route should emit a second holder warning.
   if (timing) {
-    return run(timing);
+    return run(observed);
   }
-  const observed: StoreWriterTiming = {};
   const enqueuedAt = performance.now();
   const report = (outcome: "ok" | "error") => {
     if (
       observed.reentrant !== false ||
       observed.startedAt === undefined ||
       observed.finishedAt === undefined ||
-      (observed.finishedAt - observed.startedAt < 1_000 && !reservationDiagnostics.hasSubscribers)
+      (observed.finishedAt - enqueuedAt < 1_000 && !reservationDiagnostics.hasSubscribers)
     ) {
       return;
     }
@@ -53,6 +71,19 @@ function observeWriteAdmission<T>(
     const fields = {
       operation,
       ...(caller ? { caller } : {}),
+      ...(worker
+        ? {
+            workerOperations: [...worker.operations],
+            ...(worker.transactionCount !== undefined
+              ? { transactionCount: worker.transactionCount }
+              : {}),
+          }
+        : {}),
+      ...(observed.blockingOperation ? { blockingOperation: observed.blockingOperation } : {}),
+      ...(observed.blockingCaller ? { blockingCaller: observed.blockingCaller } : {}),
+      ...(observed.blockingWorker
+        ? { blockingWorkerOperations: [...observed.blockingWorker.operations] }
+        : {}),
       outcome,
       pid: process.pid,
       threadId,
@@ -66,7 +97,7 @@ function observeWriteAdmission<T>(
     if (reservationDiagnostics.hasSubscribers) {
       reservationDiagnostics.publish(fields);
     }
-    if (observed.finishedAt - observed.startedAt < 1_000) {
+    if (observed.finishedAt - enqueuedAt < 1_000) {
       return;
     }
     try {
@@ -133,21 +164,41 @@ export function runOpenClawAgentPathWriteAdmission<T>(
   return observeWriteAdmission(
     "direct",
     timing,
-    (observed) =>
-      runQueuedStoreWrite({
-        queues: admission.queues,
-        storePath,
-        label: "agent database write admission",
-        // Worker callbacks inherit their parent's async context, but not its native
-        // writer lock. Their foreground writes must queue, never reenter that owner.
-        reentrant: reentrant && !admission.workers.has(storePath),
-        fn: async () => {
-          assertCurrent();
-          return await run(identity, assertCurrent);
-        },
-        timing: observed,
+    (observed) => {
+      const holder = admission.queues.get(storePath)?.holder;
+      // Retain only attribution, not the holder's timing or its own blocking chain.
+      observed.blockingOperation = holder?.operation;
+      observed.blockingCaller = holder?.caller;
+      observed.blockingWorker = holder?.worker;
+      // Cold tasks may need a host write before releasing their admission turn.
+      return runWithSqliteDatabaseAdmissionTurn(
+        [pathname],
+        () =>
+          runQueuedStoreWrite({
+            queues: admission.queues,
+            storePath,
+            label: "agent database write admission",
+            // Worker callbacks inherit their parent's async context, but not its native
+            // writer lock. Their foreground writes must queue, never reenter that owner.
+            reentrant: reentrant && !admission.queues.get(storePath)?.holder?.worker,
+            fn: async () => {
+              assertCurrent();
+              const queue = admission.queues.get(storePath)!;
+              const previousHolder = queue.holder;
+              queue.holder = observed;
+              try {
+                return await run(identity, assertCurrent);
+              } finally {
+                queue.holder = previousHolder;
+              }
+            },
+            timing: observed,
+            signal,
+          }),
+        [],
         signal,
-      }),
+      );
+    },
     caller,
   );
 }
@@ -159,6 +210,7 @@ export async function runOpenClawAgentWorkerWrite<T>(
   timing?: StoreWriterTiming,
   signal?: AbortSignal,
   priority?: "background",
+  caller?: WorkerReservationCaller,
 ): Promise<T> {
   if (priority === "background") {
     const storePath = readDatabasePathIdentitySync(
@@ -171,25 +223,21 @@ export async function runOpenClawAgentWorkerWrite<T>(
       await racePromiseWithAbortSignal(draining, signal, (aborted) => aborted.reason);
     }
   }
-  return observeWriteAdmission("worker", timing, (observed) => {
-    return runOpenClawAgentWriteAdmission(
-      options,
-      async ({ canonicalPath: storePath }) => {
-        const owner = {};
-        admission.workers.set(storePath, owner);
-        try {
-          return await run();
-        } finally {
-          if (admission.workers.get(storePath) === owner) {
-            admission.workers.delete(storePath);
-          }
-        }
-      },
-      true,
-      observed,
-      signal,
-    );
-  });
+  const worker: SqliteWorkerReservationObservation = { operations: new Set() };
+  return observeWriteAdmission(
+    "worker",
+    timing,
+    (observed) =>
+      runOpenClawAgentWriteAdmission(
+        options,
+        () => withSqliteWorkerReservationObservation(worker, run),
+        true,
+        observed,
+        signal,
+      ),
+    caller,
+    worker,
+  );
 }
 
 /** Compose the existing foreground queues without inverting inherited acquisition order. */
@@ -212,7 +260,7 @@ export async function runOpenClawAgentWriteAdmissions<T>(
     paths.some(
       (pathname) =>
         inherited.includes(pathname) &&
-        (!reentrant || paths.length !== 1 || admission.workers.has(pathname)),
+        (!reentrant || paths.length !== 1 || admission.queues.get(pathname)?.holder?.worker),
     )
   ) {
     throw new Error("Session read batch cannot reenter an active SQLite writer admission");
@@ -220,12 +268,18 @@ export async function runOpenClawAgentWriteAdmissions<T>(
   if (paths.some((pathname) => inherited.some((held) => held > pathname))) {
     throw new Error("Session read batch would invert inherited SQLite writer admission order");
   }
-  return await runStoreWriterAcquisitions((index, next) => {
-    const pathname = paths[index];
-    return pathname === undefined
-      ? Promise.resolve().then(run)
-      : observeWriteAdmission("ordered-read", undefined, (timing) =>
-          runOpenClawAgentWriteAdmission(selected.get(pathname)!, next, true, timing, signal),
-        );
-  });
+  return await runWithSqliteDatabaseAdmissionTurn(
+    paths,
+    () =>
+      runStoreWriterAcquisitions((index, next) => {
+        const pathname = paths[index];
+        return pathname === undefined
+          ? Promise.resolve().then(run)
+          : observeWriteAdmission("ordered-read", undefined, (timing) =>
+              runOpenClawAgentWriteAdmission(selected.get(pathname)!, next, true, timing, signal),
+            );
+      }),
+    [],
+    signal,
+  );
 }

@@ -113,10 +113,10 @@ foreign key is retained and installed only after both tables exist. Generating a
 fragment does not activate PostgreSQL shared-state runtime support.
 
 `state.postgres.sql` and each manifest `file` contain the single runtime form of
-their state DDL. They omit transaction wrappers and fixed schema qualification;
-the owning connection supplies the namespace and transaction. The separate
-`agent.postgres.sql` readiness artifact retains its schema and transaction
-wrappers until the agent-store cutover.
+their state DDL. The generated `runtime.ts` module packages that same SQL with
+fragment activation/dependencies and the expected catalog for the state owner;
+it does not maintain a separate schema definition. They omit transaction wrappers and fixed schema qualification;
+the owning connection supplies the namespace and transaction. The `agent.postgres.sql` artifact follows the same runtime-only convention.
 
 For a manual state-schema check, run `psql` from the generated directory and
 supply the transaction and chosen schema explicitly:
@@ -197,13 +197,18 @@ See [Database engines (experimental)](/reference/database-engines) for SecretRef
 configuration, isolation and durability, matched anchor/schema backups,
 limitations, and engine-boundary observation. Missing secrets, connection failures,
 and admission errors never fall back to SQLite. Existing SQLite workboard data
-refuses the switch until a port tool is available.
+requires the supported offline `openclaw database port` flow before switching engines.
 
 `pnpm db:postgres:gen --target workboard` generates the workboard DDL from its
 SQLite schema; `pnpm db:postgres:check` verifies freshness. Admission installs the
-tables and records the current store version in one transaction. There are no
-PostgreSQL migrations yet: an existing version mismatch refuses to open and names
-the expected version. Opening a PostgreSQL anchor with the SQLite engine also
+tables and records the current store version in one transaction. Owners supply
+consecutive forward migrations, each with its source and destination generated DDL.
+The engine retains writer custody and rolls back all pending steps on failure,
+including a result that differs from the generated destination;
+newer versions and missing migrations refuse with recovery guidance. Catalog
+fingerprints detect exact schema drift, while generated DDL hashes fence build
+mismatches. A server-major change performs one scratch comparison using
+PostgreSQL's own deparser before replacing the fingerprint. Opening a PostgreSQL anchor with the SQLite engine also
 refuses; it never creates SQLite workboard tables in the anchor.
 
 ### Keep operations at the owning store
@@ -1136,9 +1141,8 @@ authority before they queue; online foreign database writers are unsupported.
 This path adds no freshness or schema probes between operation steps. External
 guard and transport work remain outside SQLite transactions.
 
-Hosts without the optional operation capability retain their original native
-adapters until an approved minimum-host increase permits removal. Capability
-selection precedes awaits; worker errors never activate that compatibility path.
+Bundled Reef requires the current host's operation capability. Its former
+older-host native adapters are removed; worker errors propagate to the caller.
 Stored registration JSON, reservation expiry, namespace limits, and Doctor imports
 remain unchanged.
 
@@ -1146,8 +1150,8 @@ Reef delivered-message markers use the shared-state worker for lookup and atomic
 insert-if-absent confirmation on current hosts. The inbound flow awaits ingress,
 then durable confirmation, then relay acknowledgment. Capacity failures keep the
 entry parked for retry without evicting live markers. The existing marker JSON,
-expiry, namespace and plugin-wide limits are unchanged; older hosts keep the
-behavior of their existing asynchronous keyed-store adapter. These markers retain their existing owner alongside the compound operations above.
+expiry, namespace and plugin-wide limits are unchanged. These markers retain
+their existing owner alongside the compound operations above.
 
 Reef replay claims, renewals, completion, consumption, release, and reads use the
 shared-state worker. The replay owner preserves invocation order through durable
@@ -1156,10 +1160,8 @@ claim and reuse prepared completion bytes. Inbound processing joins admitted
 heartbeat renewals before returning. Existing-row refusal paths still renew the
 stored TTL, and an expired claim remains usable by its matching owner until a
 successor replaces it. Stored JSON, encryption, quotas, and retention are unchanged.
-Hosts without both comparison methods retain the atomic native callback path until
-an approved minimum host version guarantees both methods. Available worker failures
-never fall back. Modern domain validation errors surface
-directly, while older hosts retain their native callback error wrapping.
+The current host supplies both comparison methods. Worker failures never fall
+back to a native callback, and domain validation errors surface directly.
 
 Plugin BLOB mutations execute in the shared-state worker with the existing physical
 byte and row quotas, namespace eviction, and atomic expiry-metadata claims.
@@ -1377,7 +1379,10 @@ while replacement workers inherit the completed decision.
 Failed replies and cancelled tasks retire their exact worker without stopping
 unrelated reads. Whole-cache close drains accepted resources, including any remaining
 avatar settlement reads, before retiring the shared pool. A failed resource drain
-retains that pool for canonical cleanup retry. Path-specific close drains only
+retains that pool for canonical cleanup retry. Native handles stay open, so the
+close releases its read seal; each retry seals reads again before draining.
+A failed native retirement keeps the seal, and so does a replacement file
+published at that path before the retry. Path-specific close drains only
 operations admitted for that database.
 A best-effort quarantine read preserves the domain result, but unconfirmed
 quarantine reader cleanup also requires worker retirement before source release.
@@ -1747,8 +1752,11 @@ schema, agent owner, and physical file identity before reuse. Every request keep
 its own snapshot and current admission checks. Switching databases reuses their
 connections; admitting another retained connection evicts the least recently used
 one. Missing databases consume no retained slot. The parent keeps custody of all
-retained targets and retires the worker after 30 minutes without pending history reads; database cleanup revokes admission and joins native worker
-exit before closing the database. Cold restoration carries the request's same
+retained targets. History and search lanes retire surplus workers after 30 seconds
+idle while preserving logical reader leases; subsequent reads reopen connections
+on demand. The last worker retires after five minutes without pending reads or
+retained leases. Database cleanup revokes admission and joins native worker exit
+before closing the database. Cold restoration carries the request's same
 authority through queue waits and its native commit, so a revoked read cannot
 restore rows after database cleanup. These lifetimes change no schema or
 migration requirement.
@@ -2407,6 +2415,16 @@ SQLite. A lookup or receipt at a newer revision marks the published set incomple
 but keeps other devices' bindings; only a full list replaces the set.
 Historical inspection snapshots never publish live node authority.
 
+The pairing owner stores its monotonically increasing publication revision in
+`config_machine_state` under `devicePairing.revision`. Each paired-device write
+increments that row in the same transaction and carries the returned revision in
+its commit receipt. Pending-only and bootstrap writes leave it unchanged. An
+absent revision row means revision zero until the first paired-device write;
+existing databases need no schema migration. Exact lookups read only the keyed
+device and this revision in one statement, without loading pending requests or
+hashing all paired records. Full lists retain their complete snapshot, and connection authorization
+still looks up the device after awaited pairing work.
+
 Pairing, approval, role-token, bootstrap, and node-surface mutations execute in
 the shared-state writer. Each synchronous transaction reads the authoritative
 rows and obtains current host policy or connection admission before mutation and
@@ -2692,9 +2710,16 @@ rows are ignored and replaced by the normal resumable refresh, without a schema
 migration. Checkpoint and partition replacement remain atomic.
 
 Usage-bearing transcript publications schedule advancement through the existing
-usage worker queue, coalescing nearby publications for 100 ms. User and metadata
-rows join the next usage scan. Overview reads flush and await pending publication
-batches so a completed turn's usage is visible immediately. Startup and topology changes backfill in bounded batches,
+usage worker queue. Each dirty session waits for 30 seconds without another
+usage publication or an active agent turn. Its oldest pending change survives
+back-to-back turns: after five minutes, it can refresh in the next idle gap.
+A turn starting during a refresh may overlap its already-admitted bounded batch.
+User and metadata rows join the next usage scan. Cost and overview reads flush
+and await pending publication batches, bypassing the idle delay, so a completed
+turn's usage is visible immediately. Goal budgets and provider billing limits
+use their own current accounting, independently of this display projection.
+Shutdown cancels pending delays without flushing; committed transcripts remain
+the source of truth. Startup and topology changes backfill in bounded batches,
 yielding between batches. Cache writes wait outside the agent writer FIFO until
 foreground work drains, then commit one session at a time. Report reads use their
 separate worker lane and return partial or stale totals during backfill. Restart

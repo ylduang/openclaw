@@ -343,6 +343,24 @@ describe("pending-final delivery completion", () => {
     }
   });
 
+  it.each(["delivered", "suppressed", "unknown"] as const)(
+    "settles state-only %s custody without a preparatory read",
+    async (state) => {
+      const observed = observeActorCommands();
+      try {
+        await expect(settlePendingFinalDelivery(completion, state, ["prepared"])).resolves.toEqual({
+          state,
+        });
+        expect(observed.commands).toEqual(["session.actor.deliverySettled"]);
+        expect(
+          loadSessionEntry({ sessionKey, storePath })?.pendingFinalDelivery?.deliveries,
+        ).toEqual([{ id: completion.deliveryId, state }]);
+      } finally {
+        observed.restore();
+      }
+    },
+  );
+
   it("admits current custody in one command without a preparatory read", async () => {
     const scope = { sessionKey, storePath };
     const original = loadSessionEntry(scope)!;
@@ -505,20 +523,21 @@ describe("pending-final delivery completion", () => {
     }
   });
 
-  it("owes a notice when claimed custody is affirmed unknown", async () => {
+  it("owes a notice at direct admission and preserves it when ambiguity is affirmed", async () => {
     await installContextOnPendingFinal();
     await settlePendingFinalDelivery(completion, "unknown", ["prepared", "queued"]);
-    expect(loadSessionEntry({ sessionKey, storePath })?.pendingDeliveryNotice).toBeUndefined();
+    const notice = loadSessionEntry({ sessionKey, storePath })?.pendingDeliveryNotice;
+    expect(notice).toMatchObject({
+      intentId: completion.intentId,
+      state: "owed",
+      context: noticeContext,
+    });
 
     await expect(
       settlePendingFinalDelivery(completion, "unknown", ["queued", "unknown"]),
     ).resolves.toEqual({ state: "unknown" });
 
-    expect(loadSessionEntry({ sessionKey, storePath })?.pendingDeliveryNotice).toMatchObject({
-      intentId: completion.intentId,
-      state: "owed",
-      context: noticeContext,
-    });
+    expect(loadSessionEntry({ sessionKey, storePath })?.pendingDeliveryNotice).toEqual(notice);
   });
 
   it("does not owe a notice for the pre-dispatch claim or terminal outcomes", async () => {

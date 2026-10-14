@@ -19,7 +19,7 @@ import "@awesome.me/webawesome/dist/styles/themes/default.css";
 import "../test-helpers/load-styles.ts";
 import "../styles/settings-controls.css";
 import "../styles/settings-native-controls.css";
-import "./app-sidebar.ts";
+import "./app-sidebar.tsx";
 
 setupSidebarTest();
 
@@ -134,6 +134,9 @@ describe.runIf("__vitest_browser__" in globalThis)("sidebar session filter popov
       await expect.poll(() => occlusion).toEqual([false, true]);
       expect(ownerOptions(sidebar)).toEqual(["All owners", "Involving me", "My sessions", "Bob"]);
       const search = page.getByRole("combobox", { name: "Search", exact: true });
+      const ownersSurface = search.element().closest(".picker-select__menu")!;
+      // Settle the phone picker's opening animation before exercising Escape.
+      await Promise.all(ownersSurface.getAnimations().map((animation) => animation.finished));
       await expect.element(search).toHaveFocus();
       expect(getComputedStyle(sidebar.querySelector(".picker-select__search")!).boxShadow).not.toBe(
         "none",
@@ -141,12 +144,18 @@ describe.runIf("__vitest_browser__" in globalThis)("sidebar session filter popov
       expect(ringStyle(sidebar, ".picker-select__option[data-active]")).not.toBe("none");
       await userEvent.keyboard("bo");
       await expect.poll(() => ownerOptions(sidebar)).toEqual(["Bob"]);
+      await expect.element(search).toHaveFocus();
       await userEvent.keyboard("{Escape}");
       await expect.element(search).toHaveValue("");
       await expect.poll(() => ownerOptions(sidebar)).toHaveLength(4);
+      // Focus returns before the closing frame releases native occlusion.
+      const ownersHidden = new Promise<void>((resolve) => {
+        ownersSurface.addEventListener("overlay-after-hide", () => resolve(), { once: true });
+      });
       await userEvent.keyboard("{Escape}");
+      await ownersHidden;
       await expect.element(owners).toHaveFocus();
-      await expect.poll(() => occlusion).toEqual([false, true, false]);
+      expect(occlusion).toEqual([false, true, false]);
       await trigger.click();
       await expect.poll(() => occlusion).toEqual([false, true, false, true]);
       await expectFits();
@@ -271,7 +280,7 @@ describe.runIf("__vitest_browser__" in globalThis)("sidebar session filter popov
     await expect.element(panel).toBeVisible();
     await Promise.all(panel.getAnimations().map((animation) => animation.finished));
     expect(panel.getAttribute("aria-modal")).toBe("true");
-    expect(sidebar.querySelector(".sidebar-session-sort-menu wa-popup")).toBeNull();
+    expect(panel.matches(":popover-open")).toBe(true);
     const sheet = panel.getBoundingClientRect();
     expect(sheet.left).toBe(0);
     expect(sheet.width).toBe(innerWidth);

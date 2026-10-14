@@ -1,4 +1,6 @@
+import { isPromiseLike } from "@openclaw/normalization-core/promise-like";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
+import { runOpenClawAgentWriteAdmission } from "../../state/openclaw-agent-write-admission.js";
 import type { SessionAccessScope } from "./session-accessor.sqlite-contract.js";
 import {
   hasRegisteredSessionPendingInputOwner,
@@ -7,6 +9,7 @@ import {
 } from "./session-accessor.sqlite-pending-inputs.js";
 import { withSessionEntryWorker } from "./session-accessor.sqlite-replacement-worker.js";
 import { prepareSqliteScope } from "./session-accessor.sqlite-scope.js";
+import { hasSessionActorEmptyPendingInputHistory } from "./session-actor-replica.js";
 import {
   captureSessionActorStorageOwner,
   withSessionActorStorage,
@@ -99,6 +102,7 @@ async function readMemoryPendingInputHistory(
 async function readPendingInputRows(
   scope: Scope,
   options: Omit<PendingInputHistoryQuery, "sessionKey" | "sessionId">,
+  onRead?: (snapshot: PendingInputHistorySnapshot) => void,
 ): Promise<PendingInputHistorySnapshot> {
   const authority = { assertCurrent() {}, authorize() {} };
   const memory = captureSessionActorStorageOwner(scope, authority);
@@ -110,12 +114,22 @@ async function readPendingInputRows(
           lifetime: { assertCurrent() {}, assertReadable() {} },
           authority: memory.authority,
         },
-        (binding) =>
-          readMemoryPendingInputHistory(binding, {
+        (binding) => {
+          const query = {
             ...options,
             sessionKey: binding.actor.target.sessionKey,
             sessionId: scope.sessionId,
-          }),
+          };
+          if (onRead) {
+            const snapshot = binding.actor.storage!.readCurrent(
+              { type: "session.pendingInput.history", input: query },
+              binding.authority,
+            );
+            onRead(snapshot);
+            return snapshot;
+          }
+          return readMemoryPendingInputHistory(binding, query);
+        },
       )) ?? { rows: [], total: 0 }
     );
   }
@@ -140,7 +154,36 @@ async function readPendingInputRows(
     return { rows: [], total: 0 };
   }
   assertReadCurrent();
+  if (hasSessionActorEmptyPendingInputHistory(identity, resolved.sessionKey, query.sessionId)) {
+    return { rows: [], total: 0 };
+  }
   return withSessionHistoryWorkerDatabase(databaseOptions, async (owner) => {
+    if (onRead) {
+      const { captureSessionEntryNativeMutationWitness } =
+        await import("./session-entry-read-ordered.js");
+      // Final consumers retain writer order through publication; reconciliation
+      // belongs to ordinary history reads and must not reacquire a writer here.
+      return runOpenClawAgentWriteAdmission(
+        databaseOptions,
+        async (_identity, assertOwner) => {
+          const assertNative = captureSessionEntryNativeMutationWitness([
+            { ...databaseOptions, env: captured.env },
+          ]);
+          const snapshot = await owner.readPendingInputHistory({
+            query: { ...query, sessionKey: resolved.sessionKey },
+            env: captured.env,
+            source: readSource,
+          });
+          assertReadCurrent();
+          owner.assertCurrent();
+          assertOwner();
+          assertNative();
+          onRead(snapshot);
+          return snapshot;
+        },
+        true,
+      );
+    }
     const snapshot = await owner.readPendingInputHistory({
       query: { ...query, sessionKey: resolved.sessionKey },
       env: captured.env,
@@ -224,7 +267,24 @@ export async function listSessionPendingInputs(
 export async function readSessionPendingInput(
   scope: Scope,
   id: string,
+  /** Consume current facts synchronously before their physical reader and writer order are released. */
+  onRead?: (input: SessionPendingInput | undefined) => void,
 ): Promise<SessionPendingInput | undefined> {
-  const row = (await readPendingInputRows(scope, { id, limit: 1 })).rows[0];
+  const row = (
+    await readPendingInputRows(
+      scope,
+      { id, limit: 1 },
+      onRead
+        ? (snapshot) => {
+            const input = snapshot.rows[0];
+            const result = onRead(input ? projectSessionPendingInput(input) : undefined);
+            if (isPromiseLike(result)) {
+              void Promise.resolve(result).catch(() => {});
+              throw new Error("Pending input consumers must remain synchronous");
+            }
+          }
+        : undefined,
+    )
+  ).rows[0];
   return row ? projectSessionPendingInput(row) : undefined;
 }

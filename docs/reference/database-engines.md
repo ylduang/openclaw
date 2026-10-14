@@ -16,7 +16,9 @@ commit notifications; stores keep their existing data and operation contracts.
 ## Configure PostgreSQL
 
 Use a PostgreSQL database dedicated to OpenClaw and a role that can create schemas
-and tables. Put its connection DSN in a secret, then configure a SecretRef:
+and tables. PostgreSQL 16 or newer and UTF8 server and client encoding are required;
+admission checks these once per physical store load. No extensions are installed
+by the engine. Put its connection DSN in a secret, then configure a SecretRef:
 
 ```json5
 {
@@ -55,13 +57,73 @@ agent/session storage, and other stores continue using SQLite. Incognito storage
 remains memory-only. A supported store never silently falls back to SQLite when
 its PostgreSQL connection or admission fails.
 
-Existing SQLite workboard data cannot switch engines yet. Keep that installation
-on SQLite until the future `openclaw database port` tool is available; selecting
-PostgreSQL refuses the existing store instead of copying, replacing, or ignoring
-its data. Omitting `database` preserves the SQLite default, so ordinary updates
-require no configuration or data migration. The port command remains disabled;
-enablement depends on PostgreSQL-aware backup, update recovery, target engine
-admission, and the offline port orchestration and verification work.
+Use `openclaw database port` to move existing workboard data between engines.
+Changing `database.engine` alone does not migrate existing data. Omitting
+`database` preserves the SQLite default, so ordinary updates require no
+configuration or data migration.
+
+## Port existing workboard stores
+
+Stop the Gateway first, through the service owner that normally manages it, and
+stop embedded agents using the same state directory. The command refuses a live
+owner and never stops or restarts services for you. Configure
+`database.postgres.connection` before porting to PostgreSQL, leaving the current
+`database.engine` unchanged until the command switches it.
+
+```bash
+openclaw database port --to postgres --dry-run
+openclaw database port --to postgres
+```
+
+The command inventories all existing registered workboard stores, including
+disabled workboard plugin stores. It does not create missing stores. Shared state,
+agent databases, and safety journals remain on SQLite; shared-state and agent
+support await their respective PostgreSQL migrations. A dry run checks read-only
+prerequisites and reports checks that still require private migration, copying,
+or a PostgreSQL privilege probe. It creates no manifest, migrated copy, or target
+namespace. Add `--json` for machine-readable results without connection strings
+or row payloads.
+
+The real operation retains exact original database and config captures under
+`<stateDir>/recovery/database-port/<operation-id>/`. SQLite originals are verified
+snapshots with WAL changes settled. PostgreSQL originals include a matched
+anchor and exact SQLite export; these captures retain current rows without the
+user-backup sanitizer. Config captures include the root file and its includes.
+Keep this directory private and retain the complete set. Former PostgreSQL
+namespaces are not dropped automatically.
+
+All destination stores are privately migrated and verified before publication.
+The command replaces each store atomically, switches config last while preserving
+SecretRefs, environment references, and includes, then archives its completed
+manifest with the captures. After success, start the Gateway through its service
+owner.
+
+An interrupted operation keeps startup blocked by
+`<stateDir>/recovery/database-port/manifest.json`. Keep the Gateway stopped and
+use that active manifest with one of:
+
+```bash
+openclaw database port --resume <stateDir>/recovery/database-port/manifest.json
+openclaw database port --rollback <stateDir>/recovery/database-port/manifest.json
+```
+
+Resume revalidates the captured evidence and finishes the interrupted operation.
+Rollback restores the entire original store and config set. These options are
+mutually exclusive and cannot be combined with `--to` or `--dry-run`. Completed,
+archived manifests are not an undo command after runtime has resumed.
+
+To return to SQLite without losing writes accepted after a successful port, stop
+the Gateway and run a new reverse port:
+
+```bash
+openclaw database port --to sqlite --dry-run
+openclaw database port --to sqlite
+```
+
+Reverse-port before downgrading through a raw package manager such as npm, pnpm,
+or Homebrew: those paths bypass `openclaw update` engine compatibility checks.
+An old SQLite capture is historical and does not contain later PostgreSQL writes.
+See the [CLI reference](/cli#database).
 
 ## Isolation and durability
 
@@ -89,8 +151,16 @@ version. Admission checks run once per physical store per process load, and
 workers and handles reuse the admitted facts. Confirmed commits and uncertain
 commit outcomes invalidate cached store facts through the anchor's write token.
 
-PostgreSQL catalog admission captures columns, keys, checks, and indexes from the
-server in one consistent read. These facts are separate from the anchor's SQLite
+PostgreSQL catalog admission captures column types, nullability, exact defaults,
+keys, CHECK expressions, index definitions (including partial predicates), and
+trigger definitions and function bodies from the server in one consistent read.
+Bootstrap and migrations record a fingerprint of these PostgreSQL-deparsed facts,
+a hash of the generated DDL for the active schema, and the server major version.
+Startup compares the live fingerprint and the build's DDL hash with that record.
+A mismatch refuses admission and names the recovery step. After a server-major
+upgrade, admission compares the live catalog with generated DDL in a temporary
+namespace, removes that namespace, and records the new fingerprint only on a
+match. Unsealed pilot/ported stores receive the same one-time comparison. These facts are separate from the anchor's SQLite
 catalog. Ordinary data commits retain schema admission; schema owners publish
 replacement facts after committed DDL. Optional SQLite WAL, checkpoint, and
 page-reclamation work does not apply to PostgreSQL. Explicit SQLite integrity,
@@ -145,8 +215,7 @@ Release packages declare supported engines in the optional
 admission protocol remains `1`. Only installations with a physical non-SQLite
 store use this additional check. A target without `postgres` is refused before
 mutation with a remedy: reverse-port to SQLite with the current compatible binary,
-or stay on the current version. Reverse-port is not available yet because the
-port command remains disabled. SQLite-only installations keep their existing
+or stay on the current version. SQLite-only installations keep their existing
 admission behavior. The installed driver owns this check; a candidate cannot
 repair an older driver. See [Update admission](/cli/update#candidate-owned-admission).
 
@@ -157,33 +226,37 @@ state directory before CLI config snapshots and again after acquiring fresh
 Gateway or embedded-writer custody. An absent manifest or valid completed
 manifest permits startup. An incomplete, unreadable, malformed, or unknown
 manifest refuses startup and identifies the recovery artifact. These checks do
-not open a database. The port command and its recovery actions are not yet
-available; keep the manifest and its captured originals intact.
+not open a database. Keep the manifest and its captured originals intact, then
+use `openclaw database port --resume <manifest>` or `--rollback <manifest>`.
 
 Fresh stores bootstrap from generated PostgreSQL DDL at the current store schema
-version. PostgreSQL forward migrations are not available until schema lockstep
-tooling lands. A version mismatch refuses admission; restore a matching backup
-with its matching OpenClaw version, or keep the existing version until a supported
-migration exists. Never edit the schema version to bypass admission.
+version. Older stores run owner-supplied consecutive forward migrations under the
+PostgreSQL writer transaction and advisory lock. A failure rolls back the pending
+steps and their metadata; admitted facts publish only after commit. Each step
+compares its result with the generated destination DDL in a temporary namespace
+before recording the DDL hash and live catalog fingerprint. A missing migration
+refuses admission. Newer stores require a compatible binary, or a reverse port
+with a compatible binary before downgrade. Never edit schema metadata to bypass
+admission.
 
 The generated shared-state `state.postgres.sql` and `fragment-*.postgres.sql`
 files contain runtime DDL only. Their caller supplies the transaction and
 `search_path`; no second wrapped copy is generated. For manual readiness checks,
 see [applying the generated state DDL](/reference/database-schemas/storage-changes#shared-state-postgresql-schema-generation).
-The agent readiness artifact remains wrapped until the agent-store cutover.
+The generated agent DDL likewise leaves the transaction and search path to its owner.
 
 PostgreSQL text cannot contain NUL characters. Values containing NUL fail with an
 engine error. Search/vector capabilities remain store-specific; selecting an
 engine does not add PostgreSQL support to an unported store.
 
-| Failure                                  | Next step                                                                                                     |
-| ---------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
-| Missing or unresolved connection secret  | Configure `database.postgres.connection` and verify the SecretRef provider is available to the Gateway.       |
-| Unreachable PostgreSQL server            | Check the DSN, network access, role permissions, and server availability.                                     |
-| Store UUID mismatch                      | Restore the matching anchor and PostgreSQL schema; do not pair an anchor with another store.                  |
-| Newer or otherwise mismatched schema     | Use the matching OpenClaw version or restore its matching backup; do not force a downgrade.                   |
-| Gateway running during PostgreSQL backup | Stop through the service owner, then rerun the backup command.                                                |
-| Update target lacks PostgreSQL support   | Stay on the current version; once available, reverse-port with the current compatible binary before retrying. |
+| Failure                                   | Next step                                                                                               |
+| ----------------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| Missing or unresolved connection secret   | Configure `database.postgres.connection` and verify the SecretRef provider is available to the Gateway. |
+| Unreachable PostgreSQL server             | Check the DSN, network access, role permissions, and server availability.                               |
+| Store UUID mismatch                       | Restore the matching anchor and PostgreSQL schema; do not pair an anchor with another store.            |
+| Newer schema or missing forward migration | Use a compatible OpenClaw binary; reverse-port with that binary before a downgrade.                     |
+| Gateway running during PostgreSQL backup  | Stop through the service owner, then rerun the backup command.                                          |
+| Update target lacks PostgreSQL support    | Stay on the current version or reverse-port with the current compatible binary before retrying.         |
 
 ## Observe database work
 
