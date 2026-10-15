@@ -13,6 +13,7 @@ import {
   readClawOrphanWorkspaceInDatabase,
   readClawPackageRefsInDatabase,
 } from "../claws/provenance-read.kernel.js";
+import { readClawStateCommandInDatabase } from "../claws/state-read.kernel.js";
 import {
   isCronStateReadCommand,
   readCronStateCommandInDatabase,
@@ -33,6 +34,7 @@ import {
 } from "../gateway/operator-approval-standing-grants.worker.js";
 import {
   hasDueOperatorApprovalsInDatabase,
+  readOperatorApprovalReplayInDatabase,
   readPendingOperatorApprovalsInDatabase,
   listTerminalOperatorApprovalsInDatabase,
 } from "../gateway/operator-approval-store.kernel.worker.js";
@@ -135,6 +137,9 @@ export function readOpenClawStateDatabaseCommand(
   >,
   metadataRead: ReturnType<typeof prepareAcpSessionMetadataRead> | undefined,
 ): OpenClawStateReadResult {
+  if (command.type === "claws.inventory") {
+    return readClawStateCommandInDatabase(db, command);
+  }
   if (command.type === "claws.packageOwnership") {
     const install =
       command.agentId === undefined
@@ -326,6 +331,9 @@ export function readOpenClawStateDatabaseCommand(
   if (command.type === "operatorApprovals.hasDue") {
     return { type: command.type, hasDue: hasDueOperatorApprovalsInDatabase(command.nowMs, db) };
   }
+  if (command.type === "operatorApprovals.prepareReplay") {
+    return { type: command.type, replay: readOperatorApprovalReplayInDatabase(command.input, db) };
+  }
   if (command.type === "operatorApprovals.history") {
     return {
       type: command.type,
@@ -369,13 +377,12 @@ export function readOpenClawStateDatabaseCommand(
     };
   }
   if (command.type === "githubPublication.sharedObservation") {
-    const { kind, session, selector, entry } = command.input;
+    const { session, selector, entry } = command.input;
     return {
       type: command.type,
       row:
-        kind === "repository"
-          ? readSharedRepositoryGitHubPublicationInDatabase(db, session, selector, entry)
-          : readSharedGitHubPublicationRequestInDatabase(db, session, selector, entry),
+        readSharedRepositoryGitHubPublicationInDatabase(db, session, selector, entry) ??
+        readSharedGitHubPublicationRequestInDatabase(db, session, selector, entry),
     };
   }
   if (command.type === "githubPublication.request") {
@@ -440,6 +447,7 @@ export function readOpenClawStateDatabaseCommand(
     };
   }
   if (
+    command.type === "userModelAccounts.authorization" ||
     command.type === "userModelAccounts.links" ||
     command.type === "userModelAccounts.summary" ||
     command.type === "userModelAccounts.selection" ||
