@@ -378,7 +378,8 @@ vi.mock("../../subagents/spawn/subagent-spawn.js", () => ({
   spawnSubagentDirect: (...args: unknown[]) => hoisted.spawnSubagentDirectMock(...args),
 }));
 
-vi.mock("../../sandbox.js", () => ({
+vi.mock("../../sandbox/context.js", async () => ({
+  ...(await vi.importActual<typeof import("../../sandbox/context.js")>("../../sandbox/context.js")),
   resolveSandboxContext: (...args: unknown[]) => hoisted.resolveSandboxContextMock(...args),
 }));
 
@@ -462,8 +463,6 @@ vi.mock("../../agent-project-settings.js", () => ({
     getCompactionEnabled: () => true,
     getCompactionReserveTokens: () => hoisted.compactionReserveTokens,
     getCompactionKeepRecentTokens: () => 40_000,
-    getDefaultProvider: () => undefined,
-    getDefaultModel: () => undefined,
     getDefaultThinkingLevel: () => undefined,
     getBlockImages: () => false,
     getSteeringMode: () => undefined,
@@ -471,9 +470,6 @@ vi.mock("../../agent-project-settings.js", () => ({
     getTransport: () => undefined,
     getThinkingBudgets: () => undefined,
     getProviderRetrySettings: () => ({ maxRetryDelayMs: undefined }),
-    getImageAutoResize: () => false,
-    getShellCommandPrefix: () => undefined,
-    getShellPath: () => undefined,
     getGlobalSettings: () => ({}),
     getProjectSettings: () => ({}),
     applyOverrides: () => {},
