@@ -1,5 +1,5 @@
 {
-  "startupJsGzipBytes": 315852,
-  "reason": "Defer header session and sharing menus; retain Settings-only copy behind Settings",
-  "updatedAt": "2026-10-22"
+  "startupJsGzipBytes": 282539,
+  "reason": "Defer 245 optional feature English strings: matched b19bade build 285482 to 282539 B gzip with 7 JS and 1 CSS request.",
+  "updatedAt": "2026-10-23"
 }

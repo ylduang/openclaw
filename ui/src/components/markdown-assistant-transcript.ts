@@ -6,6 +6,12 @@ import {
 } from "../../../packages/markdown-core/src/assistant-transcript.js";
 import { escapeHtml } from "../../../src/shared/html-escape.js";
 import { t } from "../i18n/index.ts";
+import { registerChatMediaEnglish } from "../i18n/locales/en-chat-media.ts";
+import { restoreMarkdownHumanMentions } from "./markdown-human-mentions.ts";
+import type { MarkdownRenderEnv } from "./markdown-render-options.ts";
+import { normalizeMarkdownLineBreaks } from "./markdown-text.ts";
+
+registerChatMediaEnglish();
 
 function renderAssistantTranscriptRoleMarker(text: string): string {
   return `<code class="assistant-transcript-role">${escapeHtml(text)}</code>`;
@@ -102,13 +108,17 @@ function normalizeHtmlTextContent(value: string): string {
   return value.replace(/\r\n?/g, "\n").replace(/\0/g, "");
 }
 
-export function createAssistantTranscriptPlainTextFallback(
-  text: string,
-  enabled: boolean,
+export function createMarkdownPlainTextFallback(
+  value: string,
+  options: MarkdownRenderEnv,
 ): HTMLDivElement {
+  const text = restoreMarkdownHumanMentions(
+    normalizeMarkdownLineBreaks(value),
+    options.humanMentionTokens,
+  );
   const container = document.createElement("div");
   container.className = "markdown-plain-text-fallback";
-  if (!enabled) {
+  if (!options.assistantTranscriptRoleHeaders) {
     container.textContent = normalizeHtmlTextContent(text);
     return container;
   }
