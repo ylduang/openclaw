@@ -1,5 +1,5 @@
 {
-  "startupJsGzipBytes": 281671,
-  "reason": "Bound Cron run-history selector traversal: matched c64f3109 startup 281744 to 281671 B gzip, style CPU median down 15.25% desktop and 17.09% mobile; 7 JS and 1 CSS request unchanged.",
-  "updatedAt": "2026-10-24"
+  "startupJsGzipBytes": 270371,
+  "reason": "Settings demand loading previously reduced remote readiness by 20.77% and scripting by 49.68%, deferring 1702960 reply bytes. Integrated with main ba9f1eacbd0: same-host startup 270216 to 270371 B gzip (+155 B), five JS and one CSS request; Chat +225 B, New Session +50 B. Ratchet to the measured integrated head.",
+  "updatedAt": "2026-10-25"
 }
