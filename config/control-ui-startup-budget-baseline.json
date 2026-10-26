@@ -1,5 +1,5 @@
 {
-  "startupJsGzipBytes": 270371,
-  "reason": "Settings demand loading previously reduced remote readiness by 20.77% and scripting by 49.68%, deferring 1702960 reply bytes. Integrated with main ba9f1eacbd0: same-host startup 270216 to 270371 B gzip (+155 B), five JS and one CSS request; Chat +225 B, New Session +50 B. Ratchet to the measured integrated head.",
-  "updatedAt": "2026-10-25"
+  "startupJsGzipBytes": 271650,
+  "reason": "Same-host route grouping measures 271528 to 271650 B gzip (+122 B), with five startup JS requests and one CSS request unchanged. In 20 base/A-A/head triplets, 100 ms Cron readiness improves 912.5 to 816.2 ms (paired A/A -10.745%); total CPU is flat. Retain the measured head value under the approved small-byte measured-win policy.",
+  "updatedAt": "2026-10-26"
 }
