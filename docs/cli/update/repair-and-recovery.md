@@ -207,6 +207,11 @@ unreadable role or recovery records also prevent retirement. Take a verified bac
 when you need a long-term copy. Review and retire superseded captures with
 [`openclaw update cleanup`](#update-cleanup).
 
+If a fresh standalone capture fails before publishing its final manifest, Doctor
+removes that attempt's incomplete copy after owned work settles, while it retains
+live maintenance custody. Existing sealed copies and attempts with uncertain work,
+publication, or ownership remain protected.
+
 On Linux filesystems that reject native no-replace rename, fs-safe uses exclusive
 hard-link publication followed by source removal in native `auto` mode. Existing
 captures are never overwritten; native `require` mode still refuses unsupported
@@ -221,8 +226,9 @@ invalidate those chosen bytes or authorize restoring them over current data.
 The backup's existing database warnings remain available when a stable source
 generation could not be recorded. Unsafe source acquisition or file changes during
 copying can still leave a capture incomplete. Capture is best effort: when it fails,
-the update warns that it continues without the original-state capture, names the
-step and source paths that failed, and proceeds.
+the update reports **NO ORIGINAL-STATE SNAPSHOT** in its warning, retains the
+warning in JSON and the update run record, names the step and source paths that
+failed, and proceeds.
 If measured free space is insufficient, the warning explicitly says **this update
 has no original-state snapshot to restore from**, with needed and available bytes.
 The same warning is retained in JSON and the update run record. The update does
@@ -404,6 +410,14 @@ the Gateway for the same profile/state directory before retrying.
 Repair exits nonzero with the original recovery command when an older package
 journal remains pending and the current CLI cannot settle it. It does not report
 successful repair or continue post-update maintenance while that record remains.
+
+After an interrupted npm-to-Git update, the package directory can be a link to
+the new checkout while plugin recovery still names the original package path.
+Run `openclaw update repair` with a CLI containing this fix and the same state
+and configuration paths. Repair claims both the original package path and the
+checkout before settling that recovery. A changed link or occupied path keeps
+recovery intact; this path does not reclaim cancelled update custody through
+the link.
 
 For private retained package trees, recovery ignores widened group/other permission
 bits while verifying the package, then restores owner-only access and reports one
