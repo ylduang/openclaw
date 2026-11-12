@@ -10,6 +10,7 @@ export const gatewayPluginTestFiles = [
   "test/plugins/deep-research-recovery.gateway.test.ts",
   "test/plugins/deep-research-routing.gateway.test.ts",
   "test/plugins/deep-research-startup.gateway.test.ts",
+  "test/plugins/reef-shutdown.gateway.test.ts",
   "test/plugins/team-reports-http.gateway.test.ts",
 ];
 
@@ -377,6 +378,7 @@ export const gatewayDatabaseWorkerTestFiles = [
   "src/gateway/tools-invoke-authorization.test.ts",
   "src/gateway/tools-invoke-http.abort.test.ts",
   "src/gateway/tools-invoke-http.test.ts",
+  "src/gateway/trusted-proxy-git-coauthor.admission.test.ts",
   "src/gateway/tui-session-description-wire.test.ts",
   "src/gateway/update-recovery-cleanup.authority.integration.test.ts",
   "src/gateway/update-recovery-cleanup.destinations.integration.test.ts",
