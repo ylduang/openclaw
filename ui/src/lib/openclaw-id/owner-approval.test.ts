@@ -20,6 +20,7 @@ import {
 } from "../../../../packages/openclaw-id-protocol/src/index.ts";
 import type { GatewayBrowserClient } from "../../api/gateway.ts";
 import { createOwnerApproval, type OwnerApproval } from "./owner-approval.ts";
+import type { OpenClawIdPeopleLink, OpenClawIdRecoveryUse } from "./types.ts";
 
 const held = vi.hoisted(() => ({ d: undefined as unknown, w: undefined as unknown }));
 // mock-isolation: the signed-in account and device key come from fixtures instead of browser storage.
@@ -143,16 +144,18 @@ async function setup(
   const queue: MailboxMessage[] = [first];
   let wake: (() => void) | undefined;
   let reads = 0;
+  let deliveredBatches = 0;
   let shared: Uint8Array;
   let transcript: Uint8Array;
   let matching: string | undefined;
   const operations: string[] = [];
   let submitted: SignedStatement<"MembershipChange"> | undefined;
   let handoff: unknown;
-  let members =
+  let members: NonNullable<OpenClawIdPeopleLink["members"]> =
     invalid === "member"
       ? []
       : [{ accountId: "alice", displayName: "Alice", email: "alice@example.test" }];
+  const recoveryUses: OpenClawIdRecoveryUse[] = [];
   const mockClient = {
     request: vi.fn(async (_method: string, params: Record<string, unknown>) => {
       if (params.action === "submit") {
@@ -177,6 +180,7 @@ async function setup(
             rootPub,
             seq: 1,
             members,
+            recoveryUses,
             ownerDevices: [
               {
                 devicePub: cert.body.device_pub,
@@ -199,7 +203,10 @@ async function setup(
             wake = resolve;
           });
         }
-        return { status: 200, body: JSON.stringify({ messages: queue.splice(0), cursor: "1" }) };
+        return {
+          status: 200,
+          body: JSON.stringify({ messages: queue.splice(0), cursor: String(++deliveredBatches) }),
+        };
       }
       if (params.operation === "send") {
         const { payload } = JSON.parse(params.body as string);
@@ -263,8 +270,7 @@ async function setup(
         device_pub: formatEd25519PublicKey(device.publicKey),
         peer_key: formatIrohEndpointKey(device.publicKey),
       };
-      const before = reads;
-      queue.push({
+      const replacement: MailboxMessage = {
         ...first,
         received_at: receivedAt,
         from: { ...first.from, device_fp: await fingerprint(next.device_pub) },
@@ -278,11 +284,22 @@ async function setup(
             commit: await sasCommitment(ephN.publicKey, next),
           },
         },
-      });
+      };
+      const cursor = String(deliveredBatches + 1);
+      queue.push(replacement);
       wake?.();
-      await vi.waitFor(() => expect(reads).toBeGreaterThan(before));
+      // The next poll acknowledges this batch only after every message has been handled.
+      await vi.waitFor(() =>
+        expect(mockClient.request).toHaveBeenCalledWith(
+          "openclawId.authority",
+          expect.objectContaining({ operation: "receive", after: cursor }),
+          expect.anything(),
+        ),
+      );
       return next.request_id;
     },
+    recoveryUses,
+    members,
     notice: (
       ref: string,
       event: "kit_used" | "member_device_added" = "kit_used",
@@ -471,10 +488,53 @@ describe("local original-D SAS approval", () => {
     f.notice("fp:other", "member_device_added", "ab".repeat(16));
     f.notice("fp:member-peer", "member_device_added");
     await vi.waitFor(() => expect(f.memberDeviceAdded).toHaveBeenCalledTimes(1));
+    expect(f.memberDeviceAdded).toHaveBeenCalledWith(undefined);
     expect(f.kitUsed).not.toHaveBeenCalled();
     expect(f.operations).toEqual(["accept"]);
     expect(owner.read().requests).toHaveLength(1);
   });
+  it.each(["member_recovery_kit", "invite", "member_device", "revoked", "removed"] as const)(
+    "classifies reused peer keys by current admission, not retained kit history: %s",
+    async (admission) => {
+      const f = await setup();
+      const use: OpenClawIdRecoveryUse = {
+        seq: 9,
+        accountId: "member-mira",
+        memberName: "Mira Example",
+        deviceLabel: "Current browser",
+        peerKey: `iroh:${"12".repeat(32)}`,
+        peerFp: "fp:recovered-peer",
+        usedAt: 1_800_000_000,
+      };
+      f.recoveryUses.push({ ...use, seq: 3, deviceLabel: "Former browser" }, use);
+      if (admission !== "removed") {
+        f.members.push({
+          accountId: use.accountId,
+          displayName: use.memberName,
+          email: null,
+          devices:
+            admission === "revoked"
+              ? []
+              : [
+                  {
+                    peerKey: use.peerKey,
+                    approvedBy:
+                      admission === "invite"
+                        ? { kind: admission, invite_id: "new-invite" }
+                        : { kind: admission, device_fp: `fp:${"34".repeat(32)}` },
+                  },
+                ],
+        });
+      }
+      f.notice(use.peerFp, "member_device_added");
+      await vi.waitFor(() => expect(f.memberDeviceAdded).toHaveBeenCalledTimes(1));
+      expect(f.memberDeviceAdded).toHaveBeenCalledWith(
+        admission === "member_recovery_kit" ? use : undefined,
+      );
+      expect(f.kitUsed).not.toHaveBeenCalled();
+      expect(f.operations).toEqual(["accept"]);
+    },
+  );
   it("approves a browser without a node", async () => {
     const f = await setup();
     expect(owner.read().requests[0]?.tools).toBeUndefined();
