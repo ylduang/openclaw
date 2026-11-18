@@ -14,7 +14,7 @@ How OpenClaw starts and reaches the Codex app-server, and every `appServer` fiel
 
 For ordinary harness turns, OpenClaw starts a managed Codex binary: a newer
 Codex you installed yourself, or the one shipped with the official plugin
-(currently `@openai/codex` `0.162.1`):
+(currently `@openai/codex` `0.169.0`):
 
 ```bash
 codex app-server --listen stdio://
@@ -27,6 +27,28 @@ entrypoint without requiring a `codex.cmd` shim. Set `appServer.command` only
 when you intentionally want a different executable.
 
 ### Newer installed Codex
+
+New OpenAI models can require a newer Codex version than your OpenClaw release
+bundles. For GPT-6.2, [the issue report](https://github.com/openclaw/openclaw/issues/200972)
+cites Codex `0.166.0` as the minimum. Its successful test used `0.169.1`,
+so it does not establish the exact minimum. The current `0.169.0` bundle
+exceeds the reported minimum.
+
+To get a newer compatible Codex between OpenClaw releases, install it on the
+Gateway host:
+
+```bash
+npm i -g @openai/codex
+```
+
+Make sure the installed `codex` is on the Gateway's `PATH`, then restart the
+Gateway so it repeats binary selection. This is the supported between-release
+upgrade path, subject to the selection checks below.
+
+With a ChatGPT/Codex login, select the **Codex** runtime for your session.
+Check that `/status` shows `Runtime: OpenAI Codex`, then use `/codex models`
+to inspect the live catalog for your account. Installing Codex alone does not
+fix automatic routing or grant account access to a model.
 
 ChatGPT gates new models on the Codex version that runs the turn, so OpenClaw
 uses a newer Codex from `PATH` (for example `npm i -g @openai/codex`, a Bun
@@ -60,17 +82,26 @@ on `PATH` and uses it only when all of these hold:
 
 Otherwise OpenClaw uses the shipped binary. The Gateway logs one line with the
 chosen binary, its version, and the reason, for example
-`Codex app-server: using installed /usr/local/bin/codex 0.163.0 (newer than bundled 0.162.1)`
-or `Codex app-server: using bundled 0.162.1 (installed /usr/local/bin/codex 0.159.0 is not newer)`.
+`Codex app-server: using installed /usr/local/bin/codex 0.169.1 (newer than bundled 0.169.0)`
+or `Codex app-server: using bundled 0.169.0 (installed /usr/local/bin/codex 0.159.0 is not newer)`.
 
 If the selected Codex later fails to start, fails `initialize`, or reports
 another version (for example after an in-place upgrade), OpenClaw starts the
 shipped binary for that request before any thread or turn exists, logs one
-warning, and keeps using the shipped binary until the Gateway restarts. A Gateway
-restart repeats the selection, which picks up Codex installs, upgrades, and
-removals. [ChatGPT subscription model discovery](/plugins/codex-harness-reference/model-discovery#model-discovery)
-is independent of this selection, so a model in the picker may require a newer
-binary than the one running the turn.
+warning, and keeps using the shipped binary until the Gateway restarts. A
+Gateway restart repeats the selection, which picks up Codex installs, upgrades,
+and removals.
+
+The binary selection does not decide which OpenAI models the picker shows. The
+ChatGPT subscription model list reports the newest published Codex version (see
+[Model discovery](/plugins/codex-harness-reference/model-discovery)), so it can
+list a model that the selected Codex binary is too old to run. A Codex-harness
+turn on such a model fails with a message that names the running Codex version
+and asks you to update your global Codex and restart the Gateway. OpenClaw does
+not switch that turn to another harness. In Control UI, the failure offers
+**Start a new session**: a new session on the OpenClaw harness, with the same
+agent and model, that asks the agent to update Codex for you. OpenClaw itself
+never installs or updates Codex.
 
 `appServer.command`, `OPENCLAW_CODEX_APP_SERVER_BIN`, and remote app-servers
 always win. Login-status checks, node exec-servers, and the Doctor package check
@@ -273,7 +304,7 @@ If the normal app-server runtime would be `danger-full-access`, enabling
 permission profile instead. Codex-managed network enforcement is sandboxed
 networking, so a full-access profile would not protect outbound traffic.
 
-The plugin ships stable Codex app-server `0.162.1` and prefers a newer
+The plugin ships stable Codex app-server `0.169.0` and prefers a newer
 installed Codex only under the rules in
 [Newer installed Codex](#newer-installed-codex). Explicit custom
 executables, remote app-servers, and macOS desktop binaries must report a
