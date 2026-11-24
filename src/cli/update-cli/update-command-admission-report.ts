@@ -16,6 +16,7 @@ import { exitCliAfterOutput } from "../one-shot-exit.js";
 import { prepareResult, printResult } from "./progress.js";
 import {
   assertGlobalUpdateOwner,
+  assertMacosGitForUnownedCheckout,
   parseUpdateTimeoutMs,
   UpdatePreMutationError,
   type UpdateCommandOptions,
@@ -45,6 +46,9 @@ export async function assertReleaseUpdateAdmission(
 ): Promise<void> {
   try {
     await assertGlobalUpdateOwner(params);
+    if (params.installKind === "package") {
+      await assertMacosGitForUnownedCheckout(params);
+    }
   } catch (error) {
     if (!(error instanceof UpdatePreMutationError)) {
       throw error;
@@ -59,13 +63,18 @@ export async function assertReleaseUpdateAdmission(
           opts: params.opts,
           controlPlaneUpdateSentinelMeta: params.controlPlaneUpdateSentinelMeta,
         },
-        { exitCode: 0 },
+        error.reason === "git-version-unsupported" ? undefined : { exitCode: 0 },
       ),
     );
   }
   if (params.opts.reapplyLocalOverrides) {
     throw new Error(
       "--reapply-local-overrides is not supported by prepared-release updates. Save your local dist edits, update without this flag, then reapply the overrides by hand. See https://docs.openclaw.ai/install/updating#local-packaged-code-overrides",
+    );
+  }
+  if (params.opts.fullIntegrityCheck) {
+    throw new Error(
+      "--full-integrity-check is not supported by prepared-release updates. Run openclaw doctor --fix --full-integrity-check separately for full checks during migrations, then update without this flag. Doctor does not scan an already-current database as a separate verification job.",
     );
   }
 }
