@@ -25,7 +25,8 @@ import type { GatewayClient } from "./server-methods/shared-types.js";
 export function captureQueuedOperatorRecoverySource(
   authority: AdmittedRunOperatorAuthority | undefined,
 ): QueuedOperatorRecoverySource | undefined {
-  if (!authority) {
+  // A configured channel owner records no source: each start re-admits it from config.
+  if (!authority || authority.channelOwner) {
     return undefined;
   }
   assertAdmittedRunOperatorAuthority(authority);
@@ -174,9 +175,6 @@ export async function captureGatewayOperatorRecoverySnapshot(params: {
   }
   if (sourceDevice && tokenDevice === undefined && !tokenlessIdentity) {
     return { device, authPolicy, sharedGeneration, unavailableReason: "device-no-token" };
-  }
-  if (sourceDevice && tokenlessIdentity && !device) {
-    return { authPolicy, sharedGeneration, unavailableReason: "device-no-token" };
   }
   if (client.usesSharedGatewayAuth && sharedGeneration === undefined) {
     return { device, authPolicy, sharedGeneration, unavailableReason: "shared-auth-no-generation" };
